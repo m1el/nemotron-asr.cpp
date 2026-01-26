@@ -40,15 +40,15 @@ bool test_linear() {
     struct ggml_tensor * ggml_w = it->second;
 
     // Weight shape: [4096, 1024] (out_features, in_features)
-    int out_features = ref_w->shape[0];  // 4096
-    int in_features = ref_w->shape[1];   // 1024
+    size_t out_features = ref_w->shape[0];  // 4096
+    size_t in_features = ref_w->shape[1];   // 1024
 
-    printf("Weight shape: [%d, %d]\n", out_features, in_features);
+    printf("Weight shape: [%zu, %zu]\n", out_features, in_features);
 
     // Create test input [1, 5, 1024]
-    int batch = 1;
-    int seq_len = 5;
-    nemo::TensorF input({(size_t)batch, (size_t)seq_len, (size_t)in_features});
+    size_t batch = 1;
+    size_t seq_len = 5;
+    nemo::TensorF input({batch, seq_len, in_features});
 
     // Fill with test values
     for (size_t i = 0; i < input.numel(); i++) {
@@ -167,13 +167,13 @@ bool test_layer_norm() {
     struct ggml_tensor * ggml_norm_w = it_w->second;
     struct ggml_tensor * ggml_norm_b = it_b->second;
 
-    int d_model = ref_norm_w->shape[0];  // 1024
-    printf("d_model: %d\n", d_model);
+    size_t d_model = ref_norm_w->shape[0];  // 1024
+    printf("d_model: %zu\n", d_model);
 
     // Create test input [1, 5, 1024]
-    int batch = 1;
-    int seq_len = 5;
-    nemo::TensorF input({(size_t)batch, (size_t)seq_len, (size_t)d_model});
+    size_t batch = 1;
+    size_t seq_len = 5;
+    nemo::TensorF input({batch, seq_len, d_model});
 
     for (size_t i = 0; i < input.numel(); i++) {
         input.data[i] = 0.1f * (float)(i % 100) - 5.0f;
@@ -265,8 +265,8 @@ bool test_swish() {
     }
 
     // Create test input [1024]
-    int size = 1024;
-    nemo::TensorF input({(size_t)size});
+    size_t size = 1024;
+    nemo::TensorF input({size});
 
     for (size_t i = 0; i < input.numel(); i++) {
         input.data[i] = 0.1f * (float)i - 50.0f;  // Range -50 to ~50
@@ -381,14 +381,14 @@ bool test_ffn() {
     struct ggml_tensor * ggml_linear2_w = it2->second;
 
     // linear1: [4096, 1024], linear2: [1024, 4096]
-    int d_model = ref_linear1->shape[1];  // 1024
-    int d_ff = ref_linear1->shape[0];     // 4096
-    printf("d_model: %d, d_ff: %d\n", d_model, d_ff);
+    size_t d_model = ref_linear1->shape[1];  // 1024
+    size_t d_ff = ref_linear1->shape[0];     // 4096
+    printf("d_model: %zu, d_ff: %zu\n", d_model, d_ff);
 
     // Create test input [1, 5, 1024]
-    int batch = 1;
-    int seq_len = 5;
-    nemo::TensorF input({(size_t)batch, (size_t)seq_len, (size_t)d_model});
+    size_t batch = 1;
+    size_t seq_len = 5;
+    nemo::TensorF input({batch, seq_len, d_model});
 
     for (size_t i = 0; i < input.numel(); i++) {
         input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
@@ -513,20 +513,20 @@ bool test_conv2d() {
     }
 
     // PyTorch: [OC=256, IC=1, KH=3, KW=3]
-    int out_channels = ref_conv_w->shape[0];  // 256
-    int in_channels = ref_conv_w->shape[1];   // 1
-    int kH = ref_conv_w->shape[2];            // 3
-    int kW = ref_conv_w->shape[3];            // 3
+    size_t out_channels = ref_conv_w->shape[0];  // 256
+    size_t in_channels = ref_conv_w->shape[1];   // 1
+    size_t kH = ref_conv_w->shape[2];            // 3
+    size_t kW = ref_conv_w->shape[3];            // 3
 
-    printf("Conv weight shape (PyTorch): [%d, %d, %d, %d]\n", out_channels, in_channels, kH, kW);
+    printf("Conv weight shape (PyTorch): [%zu, %zu, %zu, %zu]\n", out_channels, in_channels, kH, kW);
 
     // Create small test input [batch=1, channels=1, height=10, width=128]
-    int batch = 1;
-    int in_h = 10;
-    int in_w = 128;
+    size_t batch = 1;
+    size_t in_h = 10;
+    size_t in_w = 128;
 
     // PyTorch layout: [N, C, H, W]
-    nemo::TensorF input({(size_t)batch, (size_t)in_channels, (size_t)in_h, (size_t)in_w});
+    nemo::TensorF input({batch, in_channels, in_h, in_w});
     for (size_t i = 0; i < input.numel(); i++) {
         input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
     }
@@ -598,10 +598,10 @@ bool test_conv2d() {
 
     // Convert input from [N, C, H, W] to [W, H, C, N]
     std::vector<float> inp_ggml(input.numel());
-    for (int n = 0; n < batch; n++) {
-        for (int c = 0; c < in_channels; c++) {
-            for (int h = 0; h < in_h; h++) {
-                for (int w = 0; w < in_w; w++) {
+    for (size_t n = 0; n < batch; n++) {
+        for (size_t c = 0; c < in_channels; c++) {
+            for (size_t h = 0; h < in_h; h++) {
+                for (size_t w = 0; w < in_w; w++) {
                     // PyTorch: [n, c, h, w]
                     // ggml: [w, h, c, n]
                     int src_idx = ((n * in_channels + c) * in_h + h) * in_w + w;
@@ -636,17 +636,17 @@ bool test_conv2d() {
     // ref_output: [N, OC, H_out, W_out] PyTorch
     // ggml_output: [W_out, H_out, OC, N] ggml
     float max_diff = 0.0f;
-    int out_h = ref_output.shape[2];
-    int out_w = ref_output.shape[3];
+    size_t out_h = ref_output.shape[2];
+    size_t out_w = ref_output.shape[3];
 
-    for (int n = 0; n < batch; n++) {
-        for (int oc = 0; oc < out_channels; oc++) {
-            for (int h = 0; h < out_h; h++) {
-                for (int w = 0; w < out_w; w++) {
+    for (size_t n = 0; n < batch; n++) {
+        for (size_t oc = 0; oc < out_channels; oc++) {
+            for (size_t h = 0; h < out_h; h++) {
+                for (size_t w = 0; w < out_w; w++) {
                     // PyTorch idx: [n, oc, h, w]
-                    int ref_idx = ((n * out_channels + oc) * out_h + h) * out_w + w;
+                    size_t ref_idx = ((n * out_channels + oc) * out_h + h) * out_w + w;
                     // ggml idx: [w, h, oc, n] -> w + h*W + oc*W*H + n*W*H*C
-                    int ggml_idx = w + h * out_w + oc * out_w * out_h + n * out_w * out_h * out_channels;
+                    size_t ggml_idx = w + h * out_w + oc * out_w * out_h + n * out_w * out_h * out_channels;
 
                     float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
                     max_diff = std::max(max_diff, diff);
@@ -750,11 +750,11 @@ bool test_conv_subsampling() {
     size_t file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    int batch = 1;
-    int features = 128;
-    int time_in = file_size / (sizeof(float) * features);
+    size_t batch = 1;
+    size_t features = 128;
+    size_t time_in = file_size / (sizeof(float) * features);
 
-    printf("Mel input shape: [%d, %d, %d]\n", batch, time_in, features);
+    printf("Mel input shape: [%zu, %zu, %zu]\n", batch, time_in, features);
 
     // Read raw float data - file is [time, features]
     std::vector<float> raw_mel(time_in * features);
@@ -768,9 +768,9 @@ bool test_conv_subsampling() {
     }
 
     // Reshape to [batch, time, features]
-    nemo::TensorF mel_input({(size_t)batch, (size_t)time_in, (size_t)features});
-    for (int t = 0; t < time_in; t++) {
-        for (int f = 0; f < features; f++) {
+    nemo::TensorF mel_input({batch, time_in, features});
+    for (size_t t = 0; t < time_in; t++) {
+        for (size_t f = 0; f < features; f++) {
             mel_input(0, t, f) = raw_mel[t * features + f];
         }
     }
@@ -865,7 +865,7 @@ bool test_conv_subsampling() {
     int64_t h_out = cur->ne[1];
     int64_t c_out = cur->ne[2];
 
-    printf("After conv6+relu: w_out=%lld, h_out=%lld, c_out=%lld\n", w_out, h_out, c_out);
+    printf("After conv6+relu: w_out=%ld, h_out=%ld, c_out=%ld\n", w_out, h_out, c_out);
 
     // Permute from [W, H, C, N] to [C*W, H, N] for linear projection
     // Original C++ flattens as: flat[c * W + w] = buf[c, t, w]
@@ -875,9 +875,9 @@ bool test_conv_subsampling() {
     permuted = ggml_cont(ctx0, permuted);  // Make contiguous
     permuted = ggml_reshape_3d(ctx0, permuted, w_out * c_out, h_out, batch);  // [W*C, H, N]
 
-    printf("After permute+reshape: [%lld, %lld, %lld]\n",
-           (long long)permuted->ne[0], (long long)permuted->ne[1], (long long)permuted->ne[2]);
-    printf("out_w shape: [%lld, %lld]\n", (long long)out_w->ne[0], (long long)out_w->ne[1]);
+    printf("After permute+reshape: [%ld, %ld, %ld]\n",
+           (long)permuted->ne[0], (long)permuted->ne[1], (long)permuted->ne[2]);
+    printf("out_w shape: [%ld, %ld]\n", (long)out_w->ne[0], (long)out_w->ne[1]);
 
     // Linear projection
     struct ggml_tensor * out = ggml_mul_mat(ctx0, out_w, permuted);
@@ -897,11 +897,11 @@ bool test_conv_subsampling() {
 
     // Set input (convert from [batch, time, features] to [features, time, 1, batch])
     std::vector<float> inp_ggml(mel_input.numel());
-    for (int n = 0; n < batch; n++) {
-        for (int t = 0; t < time_in; t++) {
-            for (int f = 0; f < features; f++) {
-                int src_idx = (n * time_in + t) * features + f;
-                int dst_idx = ((n * 1 + 0) * time_in + t) * features + f;
+    for (size_t n = 0; n < batch; n++) {
+        for (size_t t = 0; t < time_in; t++) {
+            for (size_t f = 0; f < features; f++) {
+                size_t src_idx = (n * time_in + t) * features + f;
+                size_t dst_idx = ((n * 1 + 0) * time_in + t) * features + f;
                 inp_ggml[dst_idx] = mel_input.data[src_idx];
             }
         }
@@ -924,9 +924,9 @@ bool test_conv_subsampling() {
            (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2]);
 
     // Check that output has expected number of elements
-    int expected_time = ref_output.shape[1];
-    int expected_features = ref_output.shape[2];
-    printf("Expected output shape: [%d, %d, %zu]\n", batch, expected_time, ref_output.shape[2]);
+    size_t expected_time = ref_output.shape[1];
+    size_t expected_features = ref_output.shape[2];
+    printf("Expected output shape: [%zu, %zu, %zu]\n", batch, expected_time, expected_features);
 
     size_t out_numel = out->ne[0] * out->ne[1] * out->ne[2];
     printf("Output numel: %zu\n", out_numel);
@@ -950,14 +950,14 @@ bool test_conv_subsampling() {
     // ref_output: [batch, time_out, 1024]
     // ggml_output: [1024, time_out, batch]
     float max_diff = 0.0f;
-    int time_out = ref_output.shape[1];
-    int d_model = ref_output.shape[2];
+    size_t time_out = ref_output.shape[1];
+    size_t d_model = ref_output.shape[2];
 
-    for (int n = 0; n < batch; n++) {
-        for (int t = 0; t < time_out; t++) {
-            for (int d = 0; d < d_model; d++) {
-                int ref_idx = (n * time_out + t) * d_model + d;
-                int ggml_idx = (n * time_out + t) * d_model + d;
+    for (size_t n = 0; n < batch; n++) {
+        for (size_t t = 0; t < time_out; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                size_t ref_idx = (n * time_out + t) * d_model + d;
+                size_t ggml_idx = (n * time_out + t) * d_model + d;
 
                 float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
                 max_diff = std::max(max_diff, diff);
