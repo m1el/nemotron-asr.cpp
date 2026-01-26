@@ -78,11 +78,23 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     kv_idx = gguf_find_key(gguf_ctx, "nemo.joint_dim");
     if (kv_idx >= 0) model.hparams.joint_dim = gguf_get_val_u32(gguf_ctx, kv_idx);
 
+    // Load vocabulary
+    kv_idx = gguf_find_key(gguf_ctx, "tokenizer.vocab");
+    if (kv_idx >= 0) {
+        const char * vocab_data = gguf_get_val_str(gguf_ctx, kv_idx);
+        size_t vocab_bytes = gguf_get_arr_n(gguf_ctx, kv_idx);
+        size_t vocab_entry_size = 8; // char8
+        size_t n_tokens = vocab_bytes / vocab_entry_size;
+        model.vocab.resize(n_tokens + 1, {0}); // +1 for empty token
+        memcpy(model.vocab.data(), vocab_data, vocab_bytes);
+    }
+
     printf("%s: n_mels     = %d\n", __func__, model.hparams.n_mels);
     printf("%s: d_model    = %d\n", __func__, model.hparams.d_model);
     printf("%s: n_heads    = %d\n", __func__, model.hparams.n_heads);
     printf("%s: n_layers   = %d\n", __func__, model.hparams.n_layers);
     printf("%s: vocab_size = %d\n", __func__, model.hparams.vocab_size);
+    printf("%s: vocab tokens = %zu\n", __func__, model.vocab.size());
 
     // Get tensor count
     int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);

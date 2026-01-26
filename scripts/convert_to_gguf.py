@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""Convert NeMo ASR model weights to GGUF format."""
+"""
+Convert NeMo ASR model weights to GGUF format.
+
+Usage:
+    uv run scripts/convert_to_gguf.py \
+        ../nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo \
+        weights/model.gguf
+"""
 
 import argparse
 import struct
+import tarfile
+from typing import Tuple
+import torch
+import yaml
 import numpy as np
 from pathlib import Path
 
@@ -22,9 +33,12 @@ GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 
 
-def write_string(f, s: str):
+def write_string(f, s: str | bytes):
     """Write a GGUF string (length + data, no null terminator)."""
-    data = s.encode('utf-8')
+    if isinstance(s, str):
+        data = s.encode('utf-8')
+    else:
+        data = s
     f.write(struct.pack('<Q', len(data)))
     f.write(data)
 
@@ -57,68 +71,32 @@ def write_kv_float32(f, key: str, value: float):
     f.write(struct.pack('<f', value))
 
 
-def load_nemo_weights(path: str) -> dict:
-    """Load weights from the custom NEMO binary format."""
-    tensors = {}
+def load_nemo_model(path: str) -> Tuple[dict, bytes]:
+    with tarfile.open(path) as tar:
+        model_config = tar.extractfile("./model_config.yaml")
+        model_config = yaml.safe_load(model_config)
+        vocab = load_vocab(model_config['joint']['vocabulary'])
+        weights = tar.extractfile("./model_weights.ckpt")
+        torch_weights = torch.load(weights, weights_only=True, map_location='cpu')
+        numpy_weights = { name: tensor.numpy() for name, tensor in torch_weights.items() }
+    return numpy_weights, vocab
 
-    with open(path, 'rb') as f:
-        # Read magic
-        magic = f.read(4)
-        if magic != b"NEMO":
-            raise ValueError(f"Invalid magic: {magic}")
 
-        # Read version
-        version = struct.unpack('<I', f.read(4))[0]
-        if version != 1:
-            raise ValueError(f"Unsupported version: {version}")
-
-        # Read number of tensors
-        n_tensors = struct.unpack('<I', f.read(4))[0]
-        print(f"Loading {n_tensors} tensors...")
-
-        for i in range(n_tensors):
-            # Read name
-            name_len = struct.unpack('<I', f.read(4))[0]
-            name = f.read(name_len).decode('utf-8')
-
-            # Read dimensions
-            n_dims = struct.unpack('<I', f.read(4))[0]
-            shape = []
-            for _ in range(n_dims):
-                dim = struct.unpack('<I', f.read(4))[0]
-                shape.append(dim)
-
-            # Read dtype
-            dtype = struct.unpack('<I', f.read(4))[0]
-
-            # Read data
-            numel = 1
-            for d in shape:
-                numel *= d
-
-            if dtype == 0:  # F32
-                data = np.frombuffer(f.read(numel * 4), dtype=np.float32).copy()
-            elif dtype == 1:  # F16
-                data = np.frombuffer(f.read(numel * 2), dtype=np.float16).astype(np.float32)
-            else:
-                raise ValueError(f"Unknown dtype: {dtype}")
-
-            data = data.reshape(shape)
-            tensors[name] = data
-
-            if i < 5 or i >= n_tensors - 2:
-                print(f"  {name}: {shape}")
-            elif i == 5:
-                print(f"  ...")
-
-    return tensors
+def load_vocab(vocab: list[str]) -> bytes:
+    print(f"Loaded vocab with {len(vocab)} tokens")
+    WORD_SIZE_BYTES = 8
+    rv = bytearray(len(vocab) * WORD_SIZE_BYTES)
+    for i, ch in enumerate(vocab):
+        # null-terminate and pad to WORD_SIZE_BYTES
+        encoded = ch.encode("utf-8") + b"\0"
+        assert len(encoded) <= WORD_SIZE_BYTES, f"token too long: {ch}"
+        rv[i * WORD_SIZE_BYTES:i * WORD_SIZE_BYTES + len(encoded)] = encoded
+    return rv
 
 
 def convert_to_gguf(input_path: str, output_path: str):
     """Convert NEMO weights to GGUF format."""
-
-    # Load weights
-    tensors = load_nemo_weights(input_path)
+    tensors, vocab = load_nemo_model(input_path)
     print(f"\nLoaded {len(tensors)} tensors")
 
     # Model hyperparameters
@@ -171,11 +149,12 @@ def convert_to_gguf(input_path: str, output_path: str):
         f.write(GGUF_MAGIC)
         f.write(struct.pack('<I', GGUF_VERSION))
         f.write(struct.pack('<q', len(tensor_infos)))  # n_tensors
-        f.write(struct.pack('<q', len(hparams) + 2))  # n_kv (hparams + general.architecture + general.name)
+        f.write(struct.pack('<q', len(hparams) + 3))  # n_kv (hparams + general.architecture + general.name)
 
         # Write KV pairs
         write_kv_string(f, "general.architecture", "nemo")
         write_kv_string(f, "general.name", "nemotron-speech-streaming-en-0.6b")
+        write_kv_string(f, "tokenizer.vocab", vocab)
 
         for key, value in hparams.items():
             if isinstance(value, int):

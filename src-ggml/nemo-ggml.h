@@ -103,10 +103,14 @@ struct nemo_joint {
     struct ggml_tensor * out_b;           // [1025]
 };
 
+struct char8 {
+    // null-terminated string, at most 7 chars
+    char data[8];
+};
 // Full model
 struct nemo_model {
     nemo_hparams hparams;
-
+    std::vector<char8> vocab;
     nemo_encoder encoder;
     nemo_decoder decoder;
     nemo_joint joint;
