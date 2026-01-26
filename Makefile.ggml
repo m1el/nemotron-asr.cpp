@@ -1,0 +1,39 @@
+# Makefile for ggml-based NeMo ASR implementation
+
+GGML_DIR = /var/data/nvidia-speech/ggml
+GGML_BUILD = $(GGML_DIR)/build
+
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS += -I $(GGML_DIR)/include
+CXXFLAGS += -I include
+
+LDFLAGS = -L $(GGML_BUILD)/src
+LDFLAGS += -lggml -lggml-base -lggml-cpu
+LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
+LDFLAGS += -lm -lpthread
+
+# Source files
+GGML_SRCS = src-ggml/nemo-ggml.cpp
+
+# Original implementation (for comparison tests)
+ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp
+
+.PHONY: all clean test
+
+all: test_ggml_weights test_ggml_compute
+
+# Test weight loading
+test_ggml_weights: tests-ggml/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+# Test computation
+test_ggml_compute: tests-ggml/test_compute.cpp $(GGML_SRCS) $(ORIG_SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+clean:
+	rm -f test_ggml_weights test_ggml_compute
+
+test: test_ggml_weights test_ggml_compute
+	./test_ggml_weights
+	./test_ggml_compute
