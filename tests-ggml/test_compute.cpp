@@ -1285,29 +1285,257 @@ bool test_pos_encoding() {
     return passed;
 }
 
+// Test Conformer Conv module
+bool test_conformer_conv() {
+    printf("=== Testing Conformer Conv Module ===\n");
+
+    // Load original weights
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return false;
+    }
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    const size_t d_model = 1024;
+    const size_t batch = 1;
+    const size_t seq_len = 20;
+
+    // Create test input [batch, time, d_model]
+    nemo::TensorF input({batch, seq_len, d_model});
+    for (size_t i = 0; i < input.numel(); i++) {
+        input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
+    }
+
+    // === Original implementation ===
+    nemo::ConformerConvolution conv_mod;
+    conv_mod.load_weights(ref_weights, "encoder.layers.0.conv");
+
+    nemo::TensorF ref_output;
+    conv_mod.forward(input, ref_output);
+
+    printf("Original output shape: [%zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2]);
+    printf("Original output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0), ref_output(0,0,1), ref_output(0,0,2),
+           ref_output(0,0,3), ref_output(0,0,4));
+
+    // === GGML implementation ===
+    auto get_tensor = [&](const char * name) -> struct ggml_tensor * {
+        auto it = ctx->model.tensors.find(name);
+        return (it != ctx->model.tensors.end()) ? it->second : nullptr;
+    };
+
+    struct ggml_tensor * pw1_w = get_tensor("encoder.layers.0.conv.pointwise_conv1.weight");
+    struct ggml_tensor * dw_w = get_tensor("encoder.layers.0.conv.depthwise_conv.weight");
+    struct ggml_tensor * bn_w = get_tensor("encoder.layers.0.conv.batch_norm.weight");
+    struct ggml_tensor * bn_b = get_tensor("encoder.layers.0.conv.batch_norm.bias");
+    struct ggml_tensor * pw2_w = get_tensor("encoder.layers.0.conv.pointwise_conv2.weight");
+
+    if (!pw1_w || !dw_w || !bn_w || !bn_b || !pw2_w) {
+        fprintf(stderr, "Missing conv module tensors\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    printf("pw1_w shape: [%lld, %lld, %lld]\n",
+           (long long)pw1_w->ne[0], (long long)pw1_w->ne[1], (long long)pw1_w->ne[2]);
+    printf("dw_w shape: [%lld, %lld, %lld]\n",
+           (long long)dw_w->ne[0], (long long)dw_w->ne[1], (long long)dw_w->ne[2]);
+    printf("pw2_w shape: [%lld, %lld, %lld]\n",
+           (long long)pw2_w->ne[0], (long long)pw2_w->ne[1], (long long)pw2_w->ne[2]);
+    fflush(stdout);
+
+    // Create compute context
+    size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead() * 2;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    // Input: [d_model, seq_len, batch] in ggml layout
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_model, seq_len, batch);
+    ggml_set_name(inp, "input");
+    ggml_set_input(inp);
+
+    // Pointwise Conv1: [d_model, seq_len, batch] -> [2048, seq_len, batch]
+    // pw1_w is [1, 1024, 2048] in ggml = [kernel=1, in_ch=1024, out_ch=2048]
+    // For 1x1 conv, we can use mul_mat: output = input @ weight
+    struct ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx0, pw1_w, d_model, 2048);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx0, pw1_w_2d, inp);
+    // cur: [2048, seq_len, batch]
+
+    // GLU: split in half, multiply first half by sigmoid of second half
+    // cur: [2048, seq_len, batch] -> [1024, seq_len, batch]
+    // Need to compute strides manually since cur is not allocated yet
+    size_t half_ch = 1024;
+    size_t full_ch = 2048;
+    size_t nb1 = full_ch * sizeof(float);  // stride to next time step
+    size_t nb2 = full_ch * seq_len * sizeof(float);  // stride to next batch
+
+    struct ggml_tensor * glu_a = ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
+                                              nb1, nb2, 0);
+    struct ggml_tensor * glu_b = ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
+                                              nb1, nb2, half_ch * sizeof(float));
+    cur = ggml_mul(ctx0, glu_a, ggml_sigmoid(ctx0, glu_b));
+    // cur: [1024, seq_len, batch]
+
+    // Depthwise Causal Conv1d: kernel_size=9, groups=1024
+    // This is complex - depthwise conv1d with causal padding
+    // For now, let's skip the full implementation and just verify the linear parts work
+    // The depthwise conv requires special handling
+
+    // For a complete test, we'd need to implement causal depthwise conv1d
+    // Let's just verify up to GLU for now
+    struct ggml_tensor * after_glu = ggml_cont(ctx0, cur);
+    ggml_set_name(after_glu, "after_glu");
+    ggml_set_output(after_glu);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, after_glu);
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    // Set input
+    ggml_backend_tensor_set(inp, input.data.data(), 0, input.numel() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output after GLU
+    std::vector<float> ggml_glu_out(half_ch * seq_len * batch);
+    ggml_backend_tensor_get(after_glu, ggml_glu_out.data(), 0, ggml_glu_out.size() * sizeof(float));
+
+    // For comparison, compute expected GLU output from original
+    // Original does: transpose -> conv1d -> transpose -> glu
+    // Let's compute the intermediate after GLU manually
+    nemo::TensorF buf1({batch, d_model, seq_len});
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                buf1(b, d, t) = input(b, t, d);
+            }
+        }
+    }
+
+    nemo::TensorF buf2;
+    const auto * pw1_ref = ref_weights.get("encoder.layers.0.conv.pointwise_conv1.weight");
+    if (!pw1_ref) {
+        fprintf(stderr, "pw1_ref tensor not found\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+    nemo::conv1d(buf1, pw1_ref->data.data(), 2048, d_model, 1, 1, 0, 1, nullptr, buf2);
+
+    nemo::TensorF buf3({batch, seq_len, 2048});
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < 2048; d++) {
+                buf3(b, t, d) = buf2(b, d, t);
+            }
+        }
+    }
+
+    nemo::TensorF ref_glu;
+    nemo::glu(buf3, ref_glu);  // [batch, time, 1024]
+
+    printf("Ref GLU output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_glu(0,0,0), ref_glu(0,0,1), ref_glu(0,0,2), ref_glu(0,0,3), ref_glu(0,0,4));
+    printf("GGML GLU output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_glu_out[0], ggml_glu_out[1], ggml_glu_out[2], ggml_glu_out[3], ggml_glu_out[4]);
+
+    // Compare GLU outputs
+    float max_diff = 0.0f;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < half_ch; d++) {
+                // ref_glu: [batch, time, 1024]
+                // ggml: [1024, time, batch]
+                float ref_val = ref_glu(b, t, d);
+                float ggml_val = ggml_glu_out[(b * seq_len + t) * half_ch + d];
+                float diff = std::abs(ref_val - ggml_val);
+                max_diff = std::max(max_diff, diff);
+            }
+        }
+    }
+
+    printf("GLU max diff: %.6e\n", max_diff);
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = max_diff < 1e-4f;
+    printf("Conformer Conv (GLU) test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+struct TestEntry {
+    const char * name;
+    bool (*func)();
+};
+
+static TestEntry tests[] = {
+    {"linear", test_linear},
+    {"layer_norm", test_layer_norm},
+    {"swish", test_swish},
+    {"ffn", test_ffn},
+    {"conv2d", test_conv2d},
+    {"conv_subsampling", test_conv_subsampling},
+    {"pos_encoding", test_pos_encoding},
+    {"rel_shift", test_rel_shift},
+    {"mha", test_mha},
+    {"conformer_conv", test_conformer_conv},
+    {nullptr, nullptr}
+};
+
 int main(int argc, char ** argv) {
-    (void)argc;
-    (void)argv;
+    const char * filter = nullptr;
+    if (argc > 1) {
+        filter = argv[1];
+    }
 
     printf("=== Testing GGML Computation vs Original ===\n\n");
 
     int passed = 0;
     int failed = 0;
+    int skipped = 0;
 
-    if (test_linear()) passed++; else failed++;
-    if (test_layer_norm()) passed++; else failed++;
-    if (test_swish()) passed++; else failed++;
-    if (test_ffn()) passed++; else failed++;
-    if (test_conv2d()) passed++; else failed++;
-    if (test_conv_subsampling()) passed++; else failed++;
-    if (test_pos_encoding()) passed++; else failed++;
-    if (test_rel_shift()) passed++; else failed++;
-    if (test_mha()) passed++; else failed++;
-    // if (test_conformer_conv()) passed++; else failed++;
+    for (int i = 0; tests[i].name != nullptr; i++) {
+        if (filter && strcmp(filter, tests[i].name) != 0) {
+            skipped++;
+            continue;
+        }
+        if (tests[i].func()) {
+            passed++;
+        } else {
+            failed++;
+        }
+    }
 
     printf("=== Summary ===\n");
     printf("Passed: %d\n", passed);
     printf("Failed: %d\n", failed);
+    if (skipped > 0) {
+        printf("Skipped: %d\n", skipped);
+    }
 
     return failed > 0 ? 1 : 0;
 }

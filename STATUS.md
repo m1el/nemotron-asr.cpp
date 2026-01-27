@@ -58,10 +58,21 @@ Key implementation notes:
 - rel_shift formula verified: out[i,j] = input[i, j + qlen - 1 - i]
 - Full MHA requires implementing rel_shift in ggml (pad-reshape-slice operation)
 
+#### Phase 6: Conformer Conv Module (IN PROGRESS)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Pointwise Conv1 + GLU | PASS | 1.8e-05 |
+| Depthwise Causal Conv1d | TODO | - |
+| Full Conv Module | TODO | - |
+
+Key implementation notes:
+- Pointwise conv1 implemented as reshape + mul_mat
+- GLU implemented as view + sigmoid + mul
+- Depthwise causal conv1d requires special handling
+
 #### Remaining Phases:
-- Phase 5 (cont): Full multi-head attention with rel_shift
-- Phase 6: Conformer Conv module (pointwise, depthwise, GLU, batch norm)
-- Phase 7: Full Conformer layer
+- Phase 6 (cont): Depthwise causal conv1d, full conv module
+- Phase 7: Full Conformer layer integration
 - Phase 8-12: Full encoder, decoder, joint, greedy decode
 
 ### File Structure
@@ -73,7 +84,7 @@ nemotron-speech.cpp/
 │   └── nemo-ggml.cpp        # Weight loading + graph builders
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
-│   └── test_compute.cpp     # Computation verification (6/6 PASS)
+│   └── test_compute.cpp     # Computation verification (10/10 PASS)
 ├── scripts/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/
