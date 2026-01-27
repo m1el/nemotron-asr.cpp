@@ -1,4 +1,5 @@
 #include "nemo-ggml.h"
+#include "preprocessor.h"
 
 #include <cstdio>
 #include <cstring>
@@ -286,6 +287,10 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     model.joint.out_w = model.tensors["joint.joint_net.2.weight"];
     model.joint.out_b = model.tensors["joint.joint_net.2.bias"];
 
+    // Preprocessor weights
+    model.preprocessor_weights.filterbank = model.tensors["preprocessor.featurizer.fb"];
+    model.preprocessor_weights.window = model.tensors["preprocessor.featurizer.window"];
+
     // Cleanup GGUF context (we've copied all data)
     gguf_free(gguf_ctx);
     ggml_free(ctx_meta);
@@ -307,6 +312,8 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     check(model.joint.enc_w, "joint.enc.weight");
     check(model.joint.dec_w, "joint.pred.weight");
     check(model.joint.out_w, "joint.joint_net.2.weight");
+    check(model.preprocessor_weights.filterbank, "preprocessor.featurizer.fb");
+    check(model.preprocessor_weights.window, "preprocessor.featurizer.window");
 
     if (missing) {
         return false;
@@ -327,11 +334,41 @@ struct nemo_context * nemo_init(const char * model_path) {
     // Initialize allocator for compute graphs
     ctx->state.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
 
+    // Initialize preprocessor from model weights
+    if (ctx->model.preprocessor_weights.filterbank && ctx->model.preprocessor_weights.window) {
+        struct ggml_tensor * fb = ctx->model.preprocessor_weights.filterbank;
+        struct ggml_tensor * win = ctx->model.preprocessor_weights.window;
+
+        // Get tensor data from backend
+        size_t fb_size = ggml_nelements(fb);
+        size_t win_size = ggml_nelements(win);
+
+        std::vector<float> fb_data(fb_size);
+        std::vector<float> win_data(win_size);
+
+        ggml_backend_tensor_get(fb, fb_data.data(), 0, fb_size * sizeof(float));
+        ggml_backend_tensor_get(win, win_data.data(), 0, win_size * sizeof(float));
+
+        ctx->preprocessor = nemo_preprocessor_init_from_data(
+            fb_data.data(), fb_size,
+            win_data.data(), win_size
+        );
+
+        if (!ctx->preprocessor) {
+            fprintf(stderr, "%s: warning: failed to initialize preprocessor from model weights\n", __func__);
+        }
+    } else {
+        fprintf(stderr, "%s: warning: preprocessor weights not found in model\n", __func__);
+    }
+
     return ctx;
 }
 
 void nemo_free(struct nemo_context * ctx) {
     if (ctx) {
+        if (ctx->preprocessor) {
+            nemo_preprocessor_free(ctx->preprocessor);
+        }
         if (ctx->state.allocr) {
             ggml_gallocr_free(ctx->state.allocr);
         }
@@ -385,6 +422,7 @@ static struct ggml_tensor * build_ffn(
     return cur;
 }
 
+/*
 // GLU activation: split input in half, multiply first half by sigmoid of second half
 static struct ggml_tensor * build_glu(
     struct ggml_context * ctx,
@@ -409,6 +447,7 @@ static struct ggml_tensor * build_glu(
     // a * sigmoid(b)
     return ggml_mul(ctx, a, ggml_sigmoid(ctx, b));
 }
+*/
 
 // LSTM cell: returns (h_out, c_out)
 static void build_lstm_cell(
@@ -855,8 +894,8 @@ struct ggml_tensor * build_encoder(
     // 1. ConvSubsampling: [n_mels, time, batch] -> [d_model, time/8, batch]
     struct ggml_tensor * cur = build_conv_subsampling(ctx, mel, &model->encoder.subsampling);
 
+    // int64_t batch = cur->ne[2];
     int64_t seq_len = cur->ne[1];  // time/8
-    int64_t batch = cur->ne[2];
 
     // 2. Get positional embeddings for this sequence length
     // pos_emb is precomputed as [d_model, 2*max_len-1], we need to slice for current seq_len
@@ -932,6 +971,7 @@ struct ggml_tensor * build_decoder_step(
     return h1_out;  // [hidden_size]
 }
 
+/*
 // Embedding lookup using ggml_get_rows
 // token_id: scalar token ID
 // Returns: [hidden_size] embedding vector
@@ -950,7 +990,7 @@ static struct ggml_tensor * build_embedding_lookup(
     // Reshape to [hidden_size]
     return ggml_reshape_1d(ctx, emb, embedding->ne[0]);
 }
-
+*/
 // ============================================================================
 // Joint Network
 // ============================================================================
@@ -1167,4 +1207,148 @@ std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<ch
         }
     }
     return result;
+}
+
+// ============================================================================
+// Public API: nemo_encode and nemo_transcribe
+// ============================================================================
+
+// Run encoder + greedy decode on mel spectrogram
+// mel_data: [n_mel_frames, n_mels] row-major float array (typically n_mels=128)
+// Returns: vector of token IDs
+std::vector<int> nemo_encode(
+    struct nemo_context * ctx,
+    const float * mel_data,
+    int n_mel_frames
+) {
+    if (!ctx || !mel_data || n_mel_frames <= 0) {
+        return {};
+    }
+
+    const int n_mels = ctx->model.hparams.n_mels;  // 128
+    const int batch = 1;
+
+    // Allocate compute context for encoder graph
+    // Need large buffer for 24 conformer layers
+    size_t buf_size = ggml_tensor_overhead() * 8000 + ggml_graph_overhead() * 4;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init ggml context\n", __func__);
+        return {};
+    }
+
+    // Create mel input tensor [n_mels, time, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_mels, n_mel_frames, batch);
+    ggml_set_name(inp, "mel_input");
+    ggml_set_input(inp);
+
+    // Build encoder graph
+    struct ggml_tensor * encoder_out = build_encoder(ctx0, inp, &ctx->model);
+    ggml_set_name(encoder_out, "encoder_output");
+    ggml_set_output(encoder_out);
+
+    // Build and allocate graph
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(gf, encoder_out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "%s: failed to allocate graph\n", __func__);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    // Set mel input - transpose from [time, mels] to [mels, time, batch]
+    // Input mel_data is row-major [n_mel_frames, n_mels]
+    std::vector<float> inp_transposed(n_mels * n_mel_frames);
+    for (int t = 0; t < n_mel_frames; t++) {
+        for (int m = 0; m < n_mels; m++) {
+            inp_transposed[m + t * n_mels] = mel_data[t * n_mels + m];
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Run encoder
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Run greedy decode on encoder output
+    std::vector<int> tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+
+    return tokens;
+}
+
+// Transcribe mel spectrogram to text
+// mel_data: [n_mel_frames, n_mels] row-major float array (typically n_mels=128)
+// Returns: transcribed text string
+std::string nemo_transcribe(
+    struct nemo_context * ctx,
+    const float * mel_data,
+    int n_mel_frames
+) {
+    std::vector<int> tokens = nemo_encode(ctx, mel_data, n_mel_frames);
+    return tokens_to_text(tokens, ctx->model.vocab);
+}
+
+// ============================================================================
+// Audio Input API
+// ============================================================================
+
+// Run encoder + greedy decode on raw PCM audio
+// audio_data: int16_t samples at 16kHz, mono
+// n_samples: number of audio samples
+// Returns: vector of token IDs
+std::vector<int> nemo_encode_audio(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples
+) {
+    if (!ctx->preprocessor) {
+        fprintf(stderr, "%s: preprocessor not initialized. "
+                "Make sure featurizer.fb.bin and featurizer.window.bin are available.\n", __func__);
+        return {};
+    }
+
+    if (n_samples <= 0) {
+        return {};
+    }
+
+    // Convert audio to mel spectrogram
+    std::vector<float> mel_data;
+    size_t n_frames = nemo_preprocessor_process(ctx->preprocessor, audio_data, n_samples, mel_data);
+
+    if (n_frames == 0) {
+        return {};
+    }
+
+    // Run encoder on mel spectrogram
+    return nemo_encode(ctx, mel_data.data(), (int)n_frames);
+}
+
+// Transcribe raw PCM audio to text
+// audio_data: int16_t samples at 16kHz, mono
+// n_samples: number of audio samples
+// Returns: transcribed text string
+std::string nemo_transcribe_audio(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples
+) {
+    std::vector<int> tokens = nemo_encode_audio(ctx, audio_data, n_samples);
+    if (tokens.empty()) {
+        return "";
+    }
+    return tokens_to_text(tokens, ctx->model.vocab);
 }

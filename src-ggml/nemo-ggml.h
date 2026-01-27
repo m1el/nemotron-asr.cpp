@@ -7,9 +7,13 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
+
+// Forward declaration
+struct nemo_preprocessor;
 
 // Model hyperparameters
 struct nemo_hparams {
@@ -134,6 +138,13 @@ struct char8 {
     // null-terminated string, at most 7 chars
     char data[8];
 };
+
+// Preprocessor weights (mel filterbank and window)
+struct nemo_preprocessor_weights {
+    struct ggml_tensor * filterbank;      // [n_mels, n_fft/2+1] = [128, 257]
+    struct ggml_tensor * window;          // [n_window_size] = [400]
+};
+
 // Full model
 struct nemo_model {
     nemo_hparams hparams;
@@ -141,6 +152,7 @@ struct nemo_model {
     nemo_encoder encoder;
     nemo_decoder decoder;
     nemo_joint joint;
+    nemo_preprocessor_weights preprocessor_weights;
 
     // Precomputed positional embeddings
     struct ggml_tensor * pos_emb;         // [max_len*2-1, 1024]
@@ -184,6 +196,9 @@ struct nemo_state {
 struct nemo_context {
     nemo_model model;
     nemo_state state;
+
+    // Audio preprocessor (optional, for audio input)
+    struct nemo_preprocessor * preprocessor = nullptr;
 
     // Number of threads for computation
     int n_threads = 4;
@@ -245,7 +260,7 @@ struct ggml_tensor * build_encoder(
     nemo_model * model              // model with all weights
 );
 
-// Run inference
+// Run inference from mel spectrogram
 std::vector<int> nemo_encode(
     struct nemo_context * ctx,
     const float * mel_data,
@@ -255,5 +270,16 @@ std::string nemo_transcribe(
     struct nemo_context * ctx,
     const float * mel_data,
     int n_mel_frames);
+
+// Run inference from raw PCM audio (16-bit signed, 16kHz, mono)
+std::vector<int> nemo_encode_audio(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples);
+
+std::string nemo_transcribe_audio(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples);
 
 #endif // NEMO_GGML_H

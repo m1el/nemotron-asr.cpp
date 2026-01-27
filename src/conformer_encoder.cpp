@@ -90,7 +90,7 @@ void ConformerEncoder::forward(const TensorF& input, TensorF& output) {
     // 1. Subsampling: [batch, time, 128] -> [batch, time/8, 1024]
     subsampling.forward(input, subsample_out_);
 
-    size_t batch = subsample_out_.shape[0];
+    // size_t batch = subsample_out_.shape[0];
     size_t time = subsample_out_.shape[1];
 
     // 2. Get positional embeddings for this sequence length

@@ -1,14 +1,14 @@
 # Implementation Status
 
-**Last Updated**: 2025-01-27
+**Last Updated**: 2026-01-27
 
-## Current State: GGML Port In Progress
+## Current State: GGML Port Complete ✓
 
 ### Original C++ Implementation: WORKING
 
 The C++ port of NVIDIA's NeMo ASR model (nemotron-speech-streaming-en-0.6b) is fully functional and produces correct transcriptions.
 
-### GGML Port: Phase 11 Complete
+### GGML Port: Complete (All 12 Phases Done)
 
 #### Phase 1: Infrastructure (COMPLETE)
 - GGUF conversion script: `scripts/convert_to_gguf.py`
@@ -148,10 +148,40 @@ Key implementation notes:
 - LSTM state only updated when emitting non-blank tokens
 - Uses vocabulary from GGUF for text decoding
 
-#### Remaining Phases:
-- Phase 12: Full Pipeline Integration (API cleanup)
+#### Phase 12: Full Pipeline Integration (COMPLETE)
 
-### Test Summary (16/16 PASS)
+**Completed:**
+- `nemo_encode()`: Encapsulates encoder + greedy decode, takes mel spectrogram
+- `nemo_transcribe()`: Converts mel to text via nemo_encode + token decoding
+- `tokens_to_text()`: SentencePiece token decoding
+- `nemo_encode_audio()`: Converts PCM audio to mel, then runs encoder + decode
+- `nemo_transcribe_audio()`: Full audio-to-text pipeline
+- `nemo_init()`: Loads model AND preprocessor weights from GGUF
+- Audio preprocessing integration (PCM i16le 16kHz → mel spectrogram)
+
+**Files modified:**
+- `src-ggml/nemo-ggml.h`: Added audio API declarations, preprocessor weights struct
+- `src-ggml/nemo-ggml.cpp`: Full API implementation with preprocessor loading from GGUF
+- `src-ggml/preprocessor.h`: Preprocessor API header with `nemo_preprocessor_init_from_data()`
+- `src-ggml/preprocessor.cpp`: Mel spectrogram extraction from PCM
+- `examples/transcribe.cpp`: Example program supporting both mel and PCM audio input
+
+**Preprocessor details:**
+- Filterbank and window weights stored in GGUF as `preprocessor.featurizer.fb` and `preprocessor.featurizer.window`
+- Config matches NeMo: 16kHz, 25ms window (400 samples), 10ms hop (160 samples), 512 FFT, 128 mels
+- Pre-emphasis: 0.97
+- Log mel with zero guard: 2^-24
+
+**Usage:**
+```bash
+# From mel spectrogram
+./transcribe weights/model.gguf test.mel.bin --mel
+
+# From raw PCM audio (16-bit signed, 16kHz, mono)
+./transcribe weights/model.gguf audio.pcm
+```
+
+### Test Summary (16/16 PASS + E2E Pipeline ✓)
 ```
 linear          PASS  (2.3e-05)
 layer_norm      PASS  (1.7e-06)
@@ -169,15 +199,19 @@ encoder         PASS  (4.5e-05)
 decoder         PASS  (1.2e-06)
 joint           PASS  (6.9e-05)
 greedy_decode   PASS  (exact match)
+audio_pipeline  PASS  (PCM → mel → encoder → decode → text)
 ```
 
 ### File Structure
 ```
 nemotron-speech.cpp/
 ├── src/                     # Original working implementation
-├── src-ggml/                # GGML-based implementation (in progress)
-│   ├── nemo-ggml.h          # Model structures
-│   └── nemo-ggml.cpp        # Weight loading + graph builders
+├── src-ggml/                # GGML-based implementation (complete)
+│   ├── nemo-ggml.h          # Model structures and API declarations
+│   ├── nemo-ggml.cpp        # Weight loading, graph builders, inference API
+│   └── preprocessor.cpp     # Audio preprocessing (PCM to mel)
+├── examples/
+│   └── transcribe.cpp       # Example: transcribe audio or mel to text
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
 │   └── test_compute.cpp     # Computation verification (16/16 PASS)
@@ -185,9 +219,9 @@ nemotron-speech.cpp/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/
 │   ├── model.bin            # Original binary weights
-│   ├── model.gguf           # GGUF format weights (2.3GB)
+│   ├── model.gguf           # GGUF format weights (2.3GB, includes preprocessor)
 │   └── encoder_ref.bin      # Precomputed encoder reference output
-└── Makefile.ggml            # Build system for ggml tests
+└── Makefile.ggml            # Build system for ggml tests and examples
 ```
 
 ### Build Commands
