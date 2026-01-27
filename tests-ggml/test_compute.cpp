@@ -4,6 +4,7 @@
 #include "../include/ops.h"
 #include "../include/conv_subsampling.h"
 #include "../include/conformer_modules.h"
+#include "../include/conformer_encoder.h"
 
 #include <cstdio>
 #include <cmath>
@@ -1012,7 +1013,8 @@ bool test_rel_shift() {
     size_t qlen = 4;
     size_t pos_len = 2 * qlen - 1;  // 7
 
-    // Create input tensor [batch, heads, qlen, pos_len]
+    // Create input tensor with layout [batch, heads, qlen, pos_len] (for reference)
+    // In ggml: [pos_len, qlen, heads, batch]
     nemo::TensorF input({batch, heads, qlen, pos_len});
 
     // Fill with recognizable values: input[b,h,i,p] = 100*h + 10*i + p
@@ -1026,22 +1028,14 @@ bool test_rel_shift() {
         }
     }
 
-    printf("Input shape: [%zu, %zu, %zu, %zu]\n", batch, heads, qlen, pos_len);
+    printf("Input shape: [%zu, %zu, %zu, %zu] (batch, heads, qlen, pos_len)\n", batch, heads, qlen, pos_len);
 
-    // === Original implementation ===
-    nemo::RelPositionMultiHeadAttention attn;
-    nemo::TensorF ref_output;
-
-    // Access private method via wrapper - we need to call rel_shift directly
-    // Since rel_shift is private, we'll compute expected values manually using the formula:
-    // out[b,h,i,j] = input[b,h,i, j + qlen - 1 - i]
-
+    // Compute expected output using formula: out[b,h,i,j] = input[b,h,i, j + qlen - 1 - i]
     nemo::TensorF expected({batch, heads, qlen, qlen});
     for (size_t b = 0; b < batch; b++) {
         for (size_t h = 0; h < heads; h++) {
             for (size_t i = 0; i < qlen; i++) {
                 for (size_t j = 0; j < qlen; j++) {
-                    // k = j + qlen - 1 - i
                     size_t k = j + qlen - 1 - i;
                     expected(b, h, i, j) = input(b, h, i, k);
                 }
@@ -1056,49 +1050,111 @@ bool test_rel_shift() {
            expected(0,0,3,0), expected(0,0,3,1), expected(0,0,3,2), expected(0,0,3,3));
 
     // === GGML implementation ===
-    // rel_shift: input[b,h,i,p] -> output[b,h,i,j] where p = j + qlen - 1 - i
-    // This can be implemented as:
-    // 1. Pad left with zeros: [b, h, qlen, pos_len+1]
-    // 2. Reshape to [b, h, pos_len+1, qlen]
-    // 3. Slice to remove first row: [b, h, pos_len, qlen]
-    // 4. Reshape back to [b, h, qlen, pos_len]
-    // 5. Slice [:,:,:,:qlen]
+    size_t buf_size = ggml_tensor_overhead() * 20 + ggml_graph_overhead();
+    std::vector<uint8_t> compute_buf(buf_size);
 
-    // Actually, ggml doesn't have convenient slice/view ops for this
-    // Let's implement it with a custom approach using permute and gather
-    // For now, let's just verify the math is correct by computing directly
+    struct ggml_init_params params = {
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
+    };
 
-    // Actually, in ggml the most efficient way is to use ggml_get_rows or custom kernel
-    // For initial testing, let's verify the original implementation works
+    struct ggml_context * ctx0 = ggml_init(params);
 
-    // We'll compute the expected rel_shift manually and verify original C++ is correct
-    // Then we can implement it in ggml later
+    // ggml tensor: [pos_len, qlen, heads, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, pos_len, qlen, heads, batch);
+    ggml_set_name(inp, "input");
+    ggml_set_input(inp);
 
-    // Verify our expected values match what rel_shift should produce
-    // For query i and key j, we want position embedding for relative position (j - i)
-    // Position embeddings are indexed as: pos_emb[pos_len-1 + (j-i)] = pos_emb[qlen-1-i+j]
-    // So for input[i, p] where p is position index, output[i, j] = input[i, j + qlen - 1 - i]
+    // Build rel_shift graph using pad-reshape-slice
+    // Step 1: Pad with zero column on left
+    struct ggml_tensor * padded = ggml_pad_ext(ctx0, inp, 1, 0, 0, 0, 0, 0, 0, 0);
 
-    printf("\nVerifying rel_shift formula:\n");
-    printf("For i=0: output[0,j] = input[0, j+3-0] = input[0, j+3]\n");
-    printf("  j=0: input[0,3] = %.1f\n", input(0,0,0,3));
-    printf("  j=1: input[0,4] = %.1f\n", input(0,0,0,4));
-    printf("  j=2: input[0,5] = %.1f\n", input(0,0,0,5));
-    printf("  j=3: input[0,6] = %.1f\n", input(0,0,0,6));
+    // Step 2: Make contiguous and reshape to [qlen, pos_len+1, heads, batch]
+    struct ggml_tensor * reshaped = ggml_reshape_4d(ctx0, ggml_cont(ctx0, padded), qlen, pos_len + 1, heads, batch);
 
-    printf("For i=3: output[3,j] = input[3, j+3-3] = input[3, j]\n");
-    printf("  j=0: input[3,0] = %.1f\n", input(0,0,3,0));
-    printf("  j=1: input[3,1] = %.1f\n", input(0,0,3,1));
-    printf("  j=2: input[3,2] = %.1f\n", input(0,0,3,2));
-    printf("  j=3: input[3,3] = %.1f\n", input(0,0,3,3));
+    // Step 3: Drop first row by offsetting view
+    struct ggml_tensor * dropped = ggml_view_4d(ctx0, reshaped,
+        qlen, pos_len, heads, batch,
+        reshaped->nb[1], reshaped->nb[2], reshaped->nb[3],
+        qlen * sizeof(float));
 
-    // The test passes if our manual formula matches expected behavior
-    // Next we need to implement rel_shift in ggml
+    // Step 4: Make contiguous and reshape back
+    struct ggml_tensor * back = ggml_reshape_4d(ctx0, ggml_cont(ctx0, dropped), pos_len, qlen, heads, batch);
 
+    // Step 5: Slice first qlen columns
+    struct ggml_tensor * out = ggml_view_4d(ctx0, back,
+        qlen, qlen, heads, batch,
+        back->nb[1], back->nb[2], back->nb[3], 0);
+    out = ggml_cont(ctx0, out);
+    ggml_set_name(out, "output");
+    ggml_set_output(out);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    // Set input data - transpose from [batch, heads, qlen, pos_len] to [pos_len, qlen, heads, batch]
+    std::vector<float> inp_data(pos_len * qlen * heads * batch);
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t h = 0; h < heads; h++) {
+            for (size_t i = 0; i < qlen; i++) {
+                for (size_t p = 0; p < pos_len; p++) {
+                    // ggml index: p + i*pos_len + h*pos_len*qlen + b*pos_len*qlen*heads
+                    inp_data[p + i*pos_len + h*pos_len*qlen + b*pos_len*qlen*heads] = input(b, h, i, p);
+                }
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_data.data(), 0, inp_data.size() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output
+    std::vector<float> ggml_out(qlen * qlen * heads * batch);
+    ggml_backend_tensor_get(out, ggml_out.data(), 0, ggml_out.size() * sizeof(float));
+
+    // ggml output is [qlen, qlen, heads, batch], convert to [batch, heads, qlen, qlen]
+    printf("GGML output[0,0,0,:]: ");
+    for (size_t j = 0; j < qlen; j++) {
+        // index: j + 0*qlen + 0*qlen*qlen + 0*qlen*qlen*heads
+        printf("%.1f ", ggml_out[j + 0*qlen + 0*qlen*qlen + 0*qlen*qlen*heads]);
+    }
+    printf("\n");
+    printf("GGML output[0,0,3,:]: ");
+    for (size_t j = 0; j < qlen; j++) {
+        printf("%.1f ", ggml_out[j + 3*qlen + 0*qlen*qlen + 0*qlen*qlen*heads]);
+    }
+    printf("\n");
+
+    // Compare
+    error_calc err;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t h = 0; h < heads; h++) {
+            for (size_t i = 0; i < qlen; i++) {
+                for (size_t j = 0; j < qlen; j++) {
+                    float exp_val = expected(b, h, i, j);
+                    // ggml output: [qlen, qlen, heads, batch] -> index = j + i*qlen + h*qlen*qlen + b*qlen*qlen*heads
+                    float ggml_val = ggml_out[j + i*qlen + h*qlen*qlen + b*qlen*qlen*heads];
+                    err.add(ggml_val, exp_val);
+                }
+            }
+        }
+    }
+
+    err.report("rel_shift");
+
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
     nemo_free(ctx);
 
-    printf("\nrel_shift formula verified: PASS\n\n");
-    return true;
+    bool passed = err.max_diff < 1e-5f;
+    printf("rel_shift test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
 }
 
 // Test Q, K, V projections for attention (simplified - tests linear projections work)
@@ -1668,6 +1724,427 @@ bool test_conformer_conv() {
     return passed;
 }
 
+// Test full relative position multi-head attention
+bool test_mha_full() {
+    printf("=== Testing Full MHA with Relative Position ===\n");
+
+    // Load original weights
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return false;
+    }
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    const size_t d_model = 1024;
+    const size_t n_heads = 8;
+    const size_t d_head = 128;
+    const size_t batch = 1;
+    const size_t seq_len = 10;
+
+    // Create test input
+    nemo::TensorF input({batch, seq_len, d_model});
+    for (size_t i = 0; i < input.numel(); i++) {
+        input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
+    }
+
+    // === Original implementation ===
+    nemo::RelPositionalEncoding pos_enc;
+    nemo::TensorF pos_emb;
+    pos_enc.get_pos_emb(seq_len, pos_emb);
+
+    nemo::RelPositionMultiHeadAttention mha;
+    mha.load_weights(ref_weights, "encoder.layers.0.self_attn");
+
+    nemo::TensorF ref_output;
+    mha.forward(input, pos_emb, ref_output);
+
+    printf("Original MHA output shape: [%zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2]);
+    printf("Original output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0), ref_output(0,0,1), ref_output(0,0,2),
+           ref_output(0,0,3), ref_output(0,0,4));
+
+    // === GGML implementation ===
+    auto get_tensor = [&](const char * name) -> struct ggml_tensor * {
+        auto it = ctx->model.tensors.find(name);
+        return (it != ctx->model.tensors.end()) ? it->second : nullptr;
+    };
+
+    struct ggml_tensor * q_w = get_tensor("encoder.layers.0.self_attn.linear_q.weight");
+    struct ggml_tensor * k_w = get_tensor("encoder.layers.0.self_attn.linear_k.weight");
+    struct ggml_tensor * v_w = get_tensor("encoder.layers.0.self_attn.linear_v.weight");
+    struct ggml_tensor * pos_w = get_tensor("encoder.layers.0.self_attn.linear_pos.weight");
+    struct ggml_tensor * out_w = get_tensor("encoder.layers.0.self_attn.linear_out.weight");
+    struct ggml_tensor * bias_u = get_tensor("encoder.layers.0.self_attn.pos_bias_u");
+    struct ggml_tensor * bias_v = get_tensor("encoder.layers.0.self_attn.pos_bias_v");
+
+    if (!q_w || !k_w || !v_w || !pos_w || !out_w || !bias_u || !bias_v) {
+        fprintf(stderr, "Missing attention tensors\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create compute context
+    size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    // Input: [d_model, time, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_model, seq_len, batch);
+    ggml_set_name(inp, "input");
+    ggml_set_input(inp);
+
+    // Position embeddings: need to slice from precomputed pos_emb
+    // For seq_len = 10, we need positions from (seq_len-1) to -(seq_len-1) = 19 positions
+    // From ggml pos_emb [d_model, 2*max_len-1], we need to extract the middle 2*seq_len-1 positions
+    size_t pos_len = 2 * seq_len - 1;
+
+    // Create position embedding input (will be set from model.pos_emb)
+    struct ggml_tensor * pos_emb_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, pos_len);
+    ggml_set_name(pos_emb_inp, "pos_emb");
+    ggml_set_input(pos_emb_inp);
+
+    // Build MHA graph using the helper function
+    // Note: We need to call the build function - but it's static in nemo-ggml.cpp
+    // For testing, we'll implement the same logic here
+
+    // Q, K, V projections
+    struct ggml_tensor * q = ggml_mul_mat(ctx0, q_w, inp);
+    struct ggml_tensor * k = ggml_mul_mat(ctx0, k_w, inp);
+    struct ggml_tensor * v = ggml_mul_mat(ctx0, v_w, inp);
+    struct ggml_tensor * pos = ggml_mul_mat(ctx0, pos_w, pos_emb_inp);
+
+    // Reshape to [d_head, n_heads, time, batch]
+    q = ggml_reshape_4d(ctx0, q, d_head, n_heads, seq_len, batch);
+    k = ggml_reshape_4d(ctx0, k, d_head, n_heads, seq_len, batch);
+    v = ggml_reshape_4d(ctx0, v, d_head, n_heads, seq_len, batch);
+    pos = ggml_reshape_3d(ctx0, pos, d_head, n_heads, pos_len);
+
+    // Permute to [d_head, time, n_heads, batch]
+    q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
+    k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3));
+    pos = ggml_cont(ctx0, ggml_permute(ctx0, pos, 0, 2, 1, 3));
+
+    // Reshape biases: [d_model] -> [d_head, 1, n_heads, 1]
+    struct ggml_tensor * bias_u_4d = ggml_reshape_4d(ctx0, bias_u, d_head, 1, n_heads, 1);
+    struct ggml_tensor * bias_v_4d = ggml_reshape_4d(ctx0, bias_v, d_head, 1, n_heads, 1);
+
+    // Add biases: q_u = q + bias_u, q_v = q + bias_v
+    struct ggml_tensor * q_u = ggml_add(ctx0, q, bias_u_4d);
+    struct ggml_tensor * q_v = ggml_add(ctx0, q, bias_v_4d);
+
+    // Content attention: q_u @ k^T -> [time, time, n_heads, batch]
+    struct ggml_tensor * content_attn = ggml_mul_mat(ctx0, k, q_u);
+
+    // Position attention: q_v @ pos^T -> [pos_len, time, n_heads, batch]
+    // mul_mat(pos, q_v): pos[d, pos_len, h], q_v[d, time, h, b]
+    // Result: [pos_len, time, h, b] where result[p, t, h, b] = sum_d q_v[d, t, h, b] * pos[d, p, h]
+    struct ggml_tensor * pos_attn_raw = ggml_mul_mat(ctx0, pos, q_v);
+
+    // Rel shift: input[p, t, h, b] -> output[j, t, h, b]
+    // where for query t and output position j: p = j + qlen - 1 - t
+    // This transforms position attention to align with key positions
+
+    // Step 1: Pad with zero column on left -> [pos_len+1, time, h, b]
+    struct ggml_tensor * padded = ggml_pad_ext(ctx0, pos_attn_raw, 1, 0, 0, 0, 0, 0, 0, 0);
+
+    // Step 2: Reshape to [time, pos_len+1, n_heads, batch]
+    // Note: padded may not be contiguous, so use ggml_cont first
+    struct ggml_tensor * reshaped = ggml_reshape_4d(ctx0, ggml_cont(ctx0, padded), seq_len, pos_len + 1, n_heads, batch);
+
+    // Step 3: Drop first row by offsetting view
+    struct ggml_tensor * dropped = ggml_view_4d(ctx0, reshaped,
+        seq_len, pos_len, n_heads, batch,
+        reshaped->nb[1], reshaped->nb[2], reshaped->nb[3],
+        seq_len * sizeof(float));
+
+    // Step 4: Make contiguous and reshape back
+    struct ggml_tensor * back = ggml_reshape_4d(ctx0, ggml_cont(ctx0, dropped), pos_len, seq_len, n_heads, batch);
+
+    // Step 5: Slice first time columns
+    struct ggml_tensor * pos_attn = ggml_view_4d(ctx0, back,
+        seq_len, seq_len, n_heads, batch,
+        back->nb[1], back->nb[2], back->nb[3], 0);
+    pos_attn = ggml_cont(ctx0, pos_attn);
+
+    // Combine: scores = (content + pos) * scale
+    float scale = 1.0f / std::sqrt((float)d_head);
+    struct ggml_tensor * attn_scores = ggml_add(ctx0, content_attn, pos_attn);
+    attn_scores = ggml_scale(ctx0, attn_scores, scale);
+
+    // Softmax over key dimension
+    struct ggml_tensor * attn_weights = ggml_soft_max(ctx0, attn_scores);
+
+    // Apply to values: context = attn_weights @ v
+    // attn_weights: [time, time, n_heads, batch] where attn[q, k] = attention from q to k
+    // v: [d_head, time, n_heads, batch] where v[d, k] = value at position k, dimension d
+    // We want: context[d, q] = sum_k attn[q, k] * v[d, k]
+    // 
+    // For ggml_mul_mat(A, B) = B @ A^T with condition A->ne[0] == B->ne[0]:
+    //   Let v_t = transpose(v) = [time, d_head, n_heads, batch]
+    //   Then mul_mat(attn_weights, v_t) where:
+    // Apply to values: context = attn_weights @ v
+    // attn_weights: [time(j), time(i), n_heads, batch] - attn[j, i] = attention from query i to key j
+    // v: [d_head, time(j), n_heads, batch]
+    // We want: context[d, i] = sum_j attn[j, i] * v[d, j]
+    // 
+    // Permute v to [time, d_head, n_heads, batch], then mul_mat(v_perm, attn_weights)
+    // gives attn_weights @ v_perm^T = [d_head, time, n_heads, batch]
+    struct ggml_tensor * v_perm = ggml_cont(ctx0, ggml_permute(ctx0, v, 1, 0, 2, 3));
+    struct ggml_tensor * context = ggml_mul_mat(ctx0, v_perm, attn_weights);
+
+    // context is [d_head, time, n_heads, batch]
+    // Permute back to [d_head, n_heads, time, batch]
+    context = ggml_cont(ctx0, ggml_permute(ctx0, context, 0, 2, 1, 3));
+
+    // Reshape to [d_model, time, batch]
+    context = ggml_reshape_3d(ctx0, context, d_model, seq_len, batch);
+
+    // Output projection
+    struct ggml_tensor * out = ggml_mul_mat(ctx0, out_w, context);
+    ggml_set_name(out, "mha_output");
+    ggml_set_output(out);
+
+    // Build and allocate graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    // Set input data (transpose from [batch, time, d_model] to [d_model, time, batch])
+    std::vector<float> inp_data(d_model * seq_len * batch);
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                inp_data[d + t * d_model + b * d_model * seq_len] = input(b, t, d);
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_data.data(), 0, inp_data.size() * sizeof(float));
+
+    // Set position embedding data
+    // pos_emb from original: [2*seq_len-1, d_model] where pos_emb(i,d) = embedding for position (seq_len-1-i)
+    // ggml expects: [d_model, pos_len]
+    std::vector<float> pos_data(d_model * pos_len);
+    for (size_t p = 0; p < pos_len; p++) {
+        for (size_t d = 0; d < d_model; d++) {
+            pos_data[d + p * d_model] = pos_emb(p, d);
+        }
+    }
+    ggml_backend_tensor_set(pos_emb_inp, pos_data.data(), 0, pos_data.size() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output
+    std::vector<float> ggml_out(d_model * seq_len * batch);
+    ggml_backend_tensor_get(out, ggml_out.data(), 0, ggml_out.size() * sizeof(float));
+
+    printf("GGML MHA output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_out[0], ggml_out[1], ggml_out[2], ggml_out[3], ggml_out[4]);
+
+    // Compare - transpose from [d_model, time, batch] to [batch, time, d_model]
+    error_calc err;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                float ref_val = ref_output(b, t, d);
+                float ggml_val = ggml_out[d + t * d_model + b * d_model * seq_len];
+                err.add(ggml_val, ref_val);
+            }
+        }
+    }
+
+    err.report("Full MHA");
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = err.max_diff < 1e-3f;  // Slightly larger tolerance for complex operation
+    printf("Full MHA test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+// Test full Conformer layer
+bool test_conformer_layer() {
+    printf("=== Testing Conformer Layer ===\n");
+
+    // Load original weights
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return false;
+    }
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    const size_t d_model = 1024;
+    const size_t batch = 1;
+    const size_t seq_len = 16;  // Keep small for testing
+    const int n_heads = 8;
+    const int d_head = 128;
+    const int kernel_size = 9;  // As specified in the model
+
+    // Create test input [batch, time, d_model]
+    nemo::TensorF input({batch, seq_len, d_model});
+    for (size_t i = 0; i < input.numel(); i++) {
+        input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
+    }
+
+    // Create position embeddings
+    nemo::RelPositionalEncoding pos_enc;
+    pos_enc.init();
+    nemo::TensorF pos_emb;
+    pos_enc.get_pos_emb(seq_len, pos_emb);
+    size_t pos_len = 2 * seq_len - 1;
+
+    printf("Input shape: [%zu, %zu, %zu]\n", batch, seq_len, d_model);
+    printf("Pos emb shape: [%zu, %zu]\n", pos_len, d_model);
+
+    // === Original implementation ===
+    nemo::ConformerLayer layer_ref;
+    layer_ref.load_weights(ref_weights, "encoder.layers.0");
+
+    nemo::TensorF ref_output;
+    layer_ref.forward(input, pos_emb, ref_output);
+
+    printf("Original output shape: [%zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2]);
+    printf("Original output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0), ref_output(0,0,1), ref_output(0,0,2),
+           ref_output(0,0,3), ref_output(0,0,4));
+
+    // === GGML implementation ===
+    // Create compute context - need more space for full layer
+    size_t buf_size = ggml_tensor_overhead() * 1500 + ggml_graph_overhead() * 2;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "Failed to init ggml context\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create input tensor [d_model, seq_len, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_model, seq_len, batch);
+    ggml_set_name(inp, "input");
+    ggml_set_input(inp);
+
+    // Create pos_emb tensor [d_model, pos_len]
+    struct ggml_tensor * pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, pos_len);
+    ggml_set_name(pos, "pos_emb");
+    ggml_set_input(pos);
+
+    // Get layer 0 weights from ggml model
+    nemo_conformer_layer * layer = &ctx->model.encoder.layers[0];
+
+    // Build full conformer layer graph
+    struct ggml_tensor * out = build_conformer_layer(ctx0, inp, pos, layer, n_heads, d_head, kernel_size);
+    ggml_set_name(out, "conformer_layer_output");
+    ggml_set_output(out);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 8192, false);
+    ggml_build_forward_expand(gf, out);
+
+    printf("Graph nodes: %d\n", ggml_graph_n_nodes(gf));
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "Failed to allocate graph\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Set input - transpose from [batch, time, d_model] to [d_model, time, batch]
+    std::vector<float> inp_transposed(input.numel());
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                size_t c_idx = (b * seq_len + t) * d_model + d;
+                size_t g_idx = d + t * d_model + b * d_model * seq_len;
+                inp_transposed[g_idx] = input.data[c_idx];
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Set pos_emb - transpose from [pos_len, d_model] to [d_model, pos_len]
+    std::vector<float> pos_transposed(pos_emb.numel());
+    for (size_t p = 0; p < pos_len; p++) {
+        for (size_t d = 0; d < d_model; d++) {
+            pos_transposed[d + p * d_model] = pos_emb(p, d);
+        }
+    }
+    ggml_backend_tensor_set(pos, pos_transposed.data(), 0, pos_transposed.size() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output
+    std::vector<float> ggml_out(batch * seq_len * d_model);
+    ggml_backend_tensor_get(out, ggml_out.data(), 0, ggml_out.size() * sizeof(float));
+
+    printf("GGML output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_out[0], ggml_out[1], ggml_out[2], ggml_out[3], ggml_out[4]);
+
+    // Compare - transpose from [d_model, time, batch] to [batch, time, d_model]
+    error_calc err;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                float ref_val = ref_output(b, t, d);
+                float ggml_val = ggml_out[d + t * d_model + b * d_model * seq_len];
+                err.add(ggml_val, ref_val);
+            }
+        }
+    }
+
+    err.report("Conformer Layer");
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = err.max_diff < 2e-3f;  // Slightly larger tolerance for complex layer
+    printf("Conformer Layer test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
 struct TestEntry {
     const char * name;
     bool (*func)();
@@ -1683,7 +2160,9 @@ static TestEntry tests[] = {
     {"pos_encoding", test_pos_encoding},
     {"rel_shift", test_rel_shift},
     {"mha", test_mha},
+    {"mha_full", test_mha_full},
     {"conformer_conv", test_conformer_conv},
+    {"conformer_layer", test_conformer_layer},
     {nullptr, nullptr}
 };
 

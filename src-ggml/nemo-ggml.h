@@ -183,6 +183,16 @@ struct ggml_tensor * nemo_build_joint(
     struct ggml_tensor * encoder_out,
     struct ggml_tensor * decoder_out);
 
+// Build full conformer layer graph
+struct ggml_tensor * build_conformer_layer(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,     // [d_model, time, batch]
+    struct ggml_tensor * pos_emb,   // [d_model, pos_len] precomputed
+    nemo_conformer_layer * layer,   // layer weights
+    int n_heads,
+    int d_head,
+    int kernel_size);
+
 // Run inference
 std::vector<int> nemo_encode(
     struct nemo_context * ctx,

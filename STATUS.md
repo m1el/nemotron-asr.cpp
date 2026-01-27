@@ -8,7 +8,7 @@
 
 The C++ port of NVIDIA's NeMo ASR model (nemotron-speech-streaming-en-0.6b) is fully functional and produces correct transcriptions.
 
-### GGML Port: Phase 3 Complete
+### GGML Port: Phase 7 Complete
 
 #### Phase 1: Infrastructure (COMPLETE)
 - GGUF conversion script: `scripts/convert_to_gguf.py`
@@ -46,17 +46,19 @@ Key implementation details:
 - Shape: [d_model, 2*max_len-1] = [1024, 1023] for max_len=512
 - Precomputed during model load, stored in `model.pos_emb`
 
-#### Phase 5: Conformer Attention (IN PROGRESS)
+#### Phase 5: Conformer Attention (COMPLETE)
 | Test | Status | Max Diff |
 |------|--------|----------|
-| rel_shift formula | PASS | (verified) |
-| Q/K/V projections | PASS | 5.7e-06 |
-| Full MHA with rel_shift | TODO | - |
+| rel_shift | PASS | 0 |
+| Full MHA with rel_shift | PASS | 7.8e-04 |
 
 Key implementation notes:
-- Q, K, V linear projections work correctly
-- rel_shift formula verified: out[i,j] = input[i, j + qlen - 1 - i]
-- Full MHA requires implementing rel_shift in ggml (pad-reshape-slice operation)
+- `build_rel_shift()` function: pad-reshape-slice to compute out[i,j] = input[i, j + qlen - 1 - i]
+- `build_rel_pos_mha()` function: complete multi-head attention with position bias
+- V @ attn_weights requires whisper-style permute: permute V to [seq, d_head, heads, batch], then mul_mat(v_perm, attn_weights)
+- Content attention: mul_mat(k, q+bias_u) for Q @ K^T
+- Position attention: mul_mat(pos, q+bias_v) + rel_shift
+- Scale after combining content + position attention
 
 #### Phase 6: Conformer Conv Module (COMPLETE)
 | Test | Status | Max Diff |
@@ -74,9 +76,41 @@ Key implementation notes:
   - Transpose kernel to [channels, kernel_size] for efficient column access
 - LayerNorm + Swish + Pointwise conv2 follow same patterns
 
+#### Phase 7: Full Conformer Layer (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Full Conformer Layer | PASS | 2.4e-04 |
+
+Key implementation notes:
+- `build_conformer_layer()` function combines all components
+- Structure: FFN(×0.5) → MHA → Conv → FFN(×0.5) → LayerNorm
+- All sub-components integrated: layer norm, FFN, MHA with rel_pos, conv module
+- Residual connections with 0.5 scale for FFN modules
+- 132 graph nodes per layer
+
+New functions added:
+- `build_conformer_conv()`: Encapsulates conv module (pointwise1 + GLU + depthwise + LN + Swish + pointwise2)
+- `build_conformer_layer()`: Full layer with all residual paths
+
 #### Remaining Phases:
-- Phase 7: Full Conformer layer integration
-- Phase 8-12: Full encoder, decoder, joint, greedy decode
+- Phase 8: Full Encoder (24 layers + subsampling)
+- Phase 9-12: Decoder, joint, greedy decode
+
+### Test Summary (12/12 PASS)
+```
+linear          PASS  (2.3e-05)
+layer_norm      PASS  (1.7e-06)
+swish           PASS  (9.5e-07)
+ffn             PASS  (3.4e-03)
+conv2d          PASS  (4.8e-07)
+conv_subsampling PASS (3.1e-03)
+pos_encoding    PASS  (0)
+rel_shift       PASS  (0)
+mha             PASS  (5.7e-06)
+mha_full        PASS  (7.8e-04)
+conformer_conv  PASS  (8.9e-04)
+conformer_layer PASS  (2.4e-04)
+```
 
 ### File Structure
 ```
@@ -87,7 +121,7 @@ nemotron-speech.cpp/
 │   └── nemo-ggml.cpp        # Weight loading + graph builders
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
-│   └── test_compute.cpp     # Computation verification (10/10 PASS)
+│   └── test_compute.cpp     # Computation verification (12/12 PASS)
 ├── scripts/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/

@@ -228,11 +228,11 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
 
         layer.norm_conv_w = model.tensors[prefix + ".norm_conv.weight"];
         layer.norm_conv_b = model.tensors[prefix + ".norm_conv.bias"];
-        layer.conv_pw1_w = model.tensors[prefix + ".conv_module.pointwise_conv1.weight"];
-        layer.conv_dw_w = model.tensors[prefix + ".conv_module.depthwise_conv.weight"];
-        layer.conv_ln_w = model.tensors[prefix + ".conv_module.batch_norm.weight"];
-        layer.conv_ln_b = model.tensors[prefix + ".conv_module.batch_norm.bias"];
-        layer.conv_pw2_w = model.tensors[prefix + ".conv_module.pointwise_conv2.weight"];
+        layer.conv_pw1_w = model.tensors[prefix + ".conv.pointwise_conv1.weight"];
+        layer.conv_dw_w = model.tensors[prefix + ".conv.depthwise_conv.weight"];
+        layer.conv_ln_w = model.tensors[prefix + ".conv.batch_norm.weight"];
+        layer.conv_ln_b = model.tensors[prefix + ".conv.batch_norm.bias"];
+        layer.conv_pw2_w = model.tensors[prefix + ".conv.pointwise_conv2.weight"];
 
         layer.norm_ff2_w = model.tensors[prefix + ".norm_feed_forward2.weight"];
         layer.norm_ff2_b = model.tensors[prefix + ".norm_feed_forward2.bias"];
@@ -424,13 +424,276 @@ static void build_lstm_cell(
     *h_out = ggml_mul(ctx, o_gate, ggml_tanh(ctx, *c_out));
 }
 
-// shut up unused function warning
-// TODO: remove when used
-int unused_functions() {
-    (void)build_lstm_cell;
-    (void)build_glu;
-    (void)build_ffn;
-    (void)build_layer_norm;
-    return 0;
+// Relative position shift: out[i,j] = input[i, j + qlen - 1 - i]
+// input: [batch, heads, qlen, pos_len] where pos_len = 2*qlen - 1
+// output: [batch, heads, qlen, qlen]
+// Implements NeMo's rel_shift operation for relative position attention
+static struct ggml_tensor * build_rel_shift(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,  // [pos_len, qlen, heads, batch] (ggml reversed)
+    int qlen
+) {
+    // In ggml layout: input is [pos_len=2*qlen-1, qlen, heads, batch]
+    // We need to slice out the correct diagonal from pos_len for each query position
+    // out[i,j] = input[i, j + qlen - 1 - i] => for each row i, we start from column (qlen-1-i)
+
+    int64_t pos_len = input->ne[0];   // 2*qlen - 1
+    int64_t heads = input->ne[2];
+    int64_t batch = input->ne[3];
+
+    // Implementation: pad left with one zero, reshape, drop first, slice
+    // Step 1: Pad with zero column on the left
+    // After pad: [pos_len+1, qlen, heads, batch]
+    struct ggml_tensor * padded = ggml_pad_ext(ctx, input, 1, 0, 0, 0, 0, 0, 0, 0);
+
+    // Step 2: Make contiguous and reshape to [qlen, pos_len+1, heads, batch]
+    struct ggml_tensor * reshaped = ggml_reshape_4d(ctx, ggml_cont(ctx, padded), qlen, pos_len + 1, heads, batch);
+
+    // Step 3: Drop first row (slice from row 1 onward)
+    // After: [qlen, pos_len, heads, batch]
+    struct ggml_tensor * dropped = ggml_view_4d(ctx, reshaped,
+        qlen, pos_len, heads, batch,
+        reshaped->nb[1], reshaped->nb[2], reshaped->nb[3],
+        qlen * ggml_element_size(reshaped));  // offset by one row
+
+    // Step 4: Make contiguous and reshape back to [pos_len, qlen, heads, batch]
+    struct ggml_tensor * back = ggml_reshape_4d(ctx, ggml_cont(ctx, dropped), pos_len, qlen, heads, batch);
+
+    // Step 5: Slice to [qlen, qlen, heads, batch] - take first qlen columns
+    struct ggml_tensor * out = ggml_view_4d(ctx, back,
+        qlen, qlen, heads, batch,
+        back->nb[1], back->nb[2], back->nb[3], 0);
+
+    return ggml_cont(ctx, out);  // Make contiguous for subsequent ops
 }
-int a = unused_functions();
+
+// Full relative position multi-head attention
+// input: [d_model, time, batch]
+// pos_emb: [d_model, pos_len] where pos_len = 2*time - 1
+// Returns: [d_model, time, batch]
+static struct ggml_tensor * build_rel_pos_mha(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,    // [d_model, time, batch]
+    struct ggml_tensor * pos_emb,  // [d_model, pos_len] precomputed
+    struct ggml_tensor * q_w,      // [d_model, d_model]
+    struct ggml_tensor * k_w,      // [d_model, d_model]
+    struct ggml_tensor * v_w,      // [d_model, d_model]
+    struct ggml_tensor * pos_w,    // [d_model, d_model]
+    struct ggml_tensor * out_w,    // [d_model, d_model]
+    struct ggml_tensor * bias_u,   // [d_model] = [heads * d_head]
+    struct ggml_tensor * bias_v,   // [d_model] = [heads * d_head]
+    int n_heads,
+    int d_head
+) {
+    int64_t d_model = input->ne[0];
+    int64_t time = input->ne[1];
+    int64_t batch = input->ne[2];
+    int64_t pos_len = pos_emb->ne[1];  // 2*time - 1
+
+    // Q, K, V projections: [d_model, time, batch]
+    struct ggml_tensor * q = ggml_mul_mat(ctx, q_w, input);
+    struct ggml_tensor * k = ggml_mul_mat(ctx, k_w, input);
+    struct ggml_tensor * v = ggml_mul_mat(ctx, v_w, input);
+
+    // Position projection: [d_model, pos_len]
+    struct ggml_tensor * pos = ggml_mul_mat(ctx, pos_w, pos_emb);
+
+    // Reshape Q, K, V to [d_head, heads, time, batch]
+    q = ggml_reshape_4d(ctx, q, d_head, n_heads, time, batch);
+    k = ggml_reshape_4d(ctx, k, d_head, n_heads, time, batch);
+    v = ggml_reshape_4d(ctx, v, d_head, n_heads, time, batch);
+
+    // Reshape pos to [d_head, heads, pos_len] (no batch dimension)
+    pos = ggml_reshape_3d(ctx, pos, d_head, n_heads, pos_len);
+
+    // Permute to [d_head, time, heads, batch] for matmul
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [d_head, time, heads, batch]
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [d_head, time, heads, batch]
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));  // [d_head, time, heads, batch]
+    pos = ggml_cont(ctx, ggml_permute(ctx, pos, 0, 2, 1, 3));  // [d_head, pos_len, heads, 1]
+
+    // Reshape bias_u, bias_v to [d_head, 1, heads, 1] for broadcasting
+    struct ggml_tensor * bias_u_4d = ggml_reshape_4d(ctx, bias_u, d_head, 1, n_heads, 1);
+    struct ggml_tensor * bias_v_4d = ggml_reshape_4d(ctx, bias_v, d_head, 1, n_heads, 1);
+
+    // q_u = q + bias_u, q_v = q + bias_v
+    struct ggml_tensor * q_u = ggml_add(ctx, q, bias_u_4d);
+    struct ggml_tensor * q_v = ggml_add(ctx, q, bias_v_4d);
+
+    // Content attention: q_u @ k^T -> [time, time, heads, batch]
+    // ggml_mul_mat(A, B) = B @ A^T, so mul_mat(k, q_u) = q_u @ k^T
+    struct ggml_tensor * content_attn = ggml_mul_mat(ctx, k, q_u);
+
+    // Position attention: q_v @ pos^T -> [pos_len, time, heads, batch]
+    // Broadcast pos across batch dimension
+    struct ggml_tensor * pos_attn_raw = ggml_mul_mat(ctx, pos, q_v);
+
+    // Rel shift to align position indices
+    struct ggml_tensor * pos_attn = build_rel_shift(ctx, pos_attn_raw, time);
+
+    // Combine: attn_scores = (content + pos) * scale
+    float scale = 1.0f / std::sqrt((float)d_head);
+    struct ggml_tensor * attn_scores = ggml_add(ctx, content_attn, pos_attn);
+    attn_scores = ggml_scale(ctx, attn_scores, scale);
+
+    // Softmax over key dimension (ne[0] = time)
+    struct ggml_tensor * attn_weights = ggml_soft_max(ctx, attn_scores);
+
+    // Apply attention to values: context = attn_weights @ v
+    // attn_weights: [time(j), time(i), heads, batch], v: [d_head, time(j), heads, batch]
+    // Want: context[d, i, h, b] = sum_j attn_weights[j, i, h, b] * v[d, j, h, b]
+    // Permute v to [time, d_head, heads, batch], then mul_mat(v_perm, attn_weights)
+    struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
+    // Result: [d_head, time, heads, batch]
+    struct ggml_tensor * context = ggml_mul_mat(ctx, v_perm, attn_weights);
+
+    // Permute to [d_head, heads, time, batch] for output reshape
+    context = ggml_cont(ctx, ggml_permute(ctx, context, 0, 2, 1, 3));
+
+    // Reshape to [d_model, time, batch]
+    context = ggml_reshape_3d(ctx, context, d_model, time, batch);
+
+    // Output projection
+    struct ggml_tensor * out = ggml_mul_mat(ctx, out_w, context);
+
+    return out;
+}
+
+// Conformer Convolution Module
+// input: [d_model, time, batch]
+// Returns: [d_model, time, batch]
+static struct ggml_tensor * build_conformer_conv(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,     // [d_model, time, batch]
+    struct ggml_tensor * pw1_w,     // [1, d_model, 2*d_model] pointwise conv1
+    struct ggml_tensor * dw_w,      // [kernel_size, 1, d_model] depthwise conv
+    struct ggml_tensor * ln_w,      // [d_model] layer norm weight
+    struct ggml_tensor * ln_b,      // [d_model] layer norm bias
+    struct ggml_tensor * pw2_w,     // [1, d_model, d_model] pointwise conv2
+    int kernel_size
+) {
+    int64_t d_model = input->ne[0];
+    int64_t seq_len = input->ne[1];
+    int64_t batch = input->ne[2];
+
+    // Pointwise Conv1: [d_model, seq_len, batch] -> [2*d_model, seq_len, batch]
+    // pw1_w is [1, d_model, 2*d_model], reshape to [d_model, 2*d_model] for matmul
+    struct ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, pw1_w, d_model, 2 * d_model);
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, pw1_w_2d, input);
+
+    // GLU: split in half, multiply first half by sigmoid of second half
+    // cur: [2*d_model, seq_len, batch] -> [d_model, seq_len, batch]
+    int64_t half_ch = d_model;
+    int64_t full_ch = 2 * d_model;
+    size_t nb1 = full_ch * sizeof(float);
+    size_t nb2 = full_ch * seq_len * sizeof(float);
+
+    struct ggml_tensor * glu_a = ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, 0);
+    struct ggml_tensor * glu_b = ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, half_ch * sizeof(float));
+    cur = ggml_mul(ctx, glu_a, ggml_sigmoid(ctx, glu_b));
+    cur = ggml_cont(ctx, cur);
+
+    // Transpose to [seq_len, d_model, batch] for conv1d
+    cur = ggml_cont(ctx, ggml_permute(ctx, cur, 1, 0, 2, 3));
+
+    // Causal padding: pad left by kernel_size-1
+    cur = ggml_pad_ext(ctx, cur, kernel_size - 1, 0, 0, 0, 0, 0, 0, 0);
+
+    // Depthwise conv1d: for each position t in output, sum over k:
+    // output[c, t] = sum_k input[c, t+k] * weight[c, k]
+    // Weight is [kernel_size, 1, d_model], reshape to [kernel_size, d_model]
+    struct ggml_tensor * dw_w_2d = ggml_reshape_2d(ctx, dw_w, kernel_size, d_model);
+    struct ggml_tensor * dw_w_t = ggml_cont(ctx, ggml_transpose(ctx, dw_w_2d));
+    // dw_w_t: [d_model, kernel_size]
+
+    struct ggml_tensor * conv_result = nullptr;
+    for (int k = 0; k < kernel_size; k++) {
+        // Extract slice at offset k
+        struct ggml_tensor * input_slice = ggml_view_3d(ctx, cur,
+            seq_len, d_model, batch,
+            cur->nb[1], cur->nb[2],
+            k * sizeof(float));
+
+        // Get k-th kernel element for each channel
+        struct ggml_tensor * kernel_k = ggml_view_1d(ctx, dw_w_t, d_model, k * d_model * sizeof(float));
+        kernel_k = ggml_reshape_3d(ctx, kernel_k, 1, d_model, 1);
+
+        // Multiply and accumulate
+        struct ggml_tensor * product = ggml_mul(ctx, input_slice, kernel_k);
+        if (conv_result == nullptr) {
+            conv_result = product;
+        } else {
+            conv_result = ggml_add(ctx, conv_result, product);
+        }
+    }
+    cur = conv_result;
+
+    // Transpose back to [d_model, seq_len, batch]
+    cur = ggml_cont(ctx, ggml_permute(ctx, cur, 1, 0, 2, 3));
+
+    // Layer norm
+    cur = ggml_norm(ctx, cur, 1e-5f);
+    cur = ggml_mul(ctx, cur, ln_w);
+    cur = ggml_add(ctx, cur, ln_b);
+
+    // Swish
+    cur = ggml_silu(ctx, cur);
+
+    // Pointwise Conv2: [d_model, seq_len, batch] -> [d_model, seq_len, batch]
+    struct ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx, pw2_w, d_model, d_model);
+    cur = ggml_mul_mat(ctx, pw2_w_2d, cur);
+
+    return cur;
+}
+
+// Full Conformer Layer
+// Structure: x -> LN -> FFN1 -> +x*0.5 -> LN -> Attn -> +x -> LN -> Conv -> +x -> LN -> FFN2 -> +x*0.5 -> LN
+// input: [d_model, time, batch]
+// pos_emb: [d_model, pos_len]
+// Returns: [d_model, time, batch]
+struct ggml_tensor * build_conformer_layer(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,     // [d_model, time, batch]
+    struct ggml_tensor * pos_emb,   // [d_model, pos_len] precomputed
+    nemo_conformer_layer * layer,   // layer weights
+    int n_heads,
+    int d_head,
+    int kernel_size
+) {
+    struct ggml_tensor * residual = input;
+    struct ggml_tensor * cur;
+
+    // 1. FFN1 path: LN -> FFN1 -> residual * 0.5
+    cur = build_layer_norm(ctx, residual, layer->norm_ff1_w, layer->norm_ff1_b);
+    cur = build_ffn(ctx, cur, layer->ffn1_linear1_w, layer->ffn1_linear2_w);
+    cur = ggml_scale(ctx, cur, 0.5f);
+    residual = ggml_add(ctx, residual, cur);
+
+    // 2. Self-attention path: LN -> Attn -> residual
+    cur = build_layer_norm(ctx, residual, layer->norm_attn_w, layer->norm_attn_b);
+    cur = build_rel_pos_mha(ctx, cur, pos_emb,
+                            layer->attn_q_w, layer->attn_k_w, layer->attn_v_w,
+                            layer->attn_pos_w, layer->attn_out_w,
+                            layer->pos_bias_u, layer->pos_bias_v,
+                            n_heads, d_head);
+    residual = ggml_add(ctx, residual, cur);
+
+    // 3. Conv path: LN -> Conv -> residual
+    cur = build_layer_norm(ctx, residual, layer->norm_conv_w, layer->norm_conv_b);
+    cur = build_conformer_conv(ctx, cur,
+                               layer->conv_pw1_w, layer->conv_dw_w,
+                               layer->conv_ln_w, layer->conv_ln_b,
+                               layer->conv_pw2_w, kernel_size);
+    residual = ggml_add(ctx, residual, cur);
+
+    // 4. FFN2 path: LN -> FFN2 -> residual * 0.5
+    cur = build_layer_norm(ctx, residual, layer->norm_ff2_w, layer->norm_ff2_b);
+    cur = build_ffn(ctx, cur, layer->ffn2_linear1_w, layer->ffn2_linear2_w);
+    cur = ggml_scale(ctx, cur, 0.5f);
+    residual = ggml_add(ctx, residual, cur);
+
+    // 5. Final layer norm
+    cur = build_layer_norm(ctx, residual, layer->norm_final_w, layer->norm_final_b);
+
+    return cur;
+}
