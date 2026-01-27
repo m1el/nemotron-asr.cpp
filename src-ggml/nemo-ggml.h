@@ -7,10 +7,21 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
+
+// Backend type for inference
+enum nemo_backend_type {
+    NEMO_BACKEND_CPU = 0,
+    NEMO_BACKEND_CUDA = 1,
+    NEMO_BACKEND_AUTO = 2,  // Auto-detect: prefer CUDA if available
+};
 
 // Forward declaration
 struct nemo_preprocessor;
@@ -161,6 +172,7 @@ struct nemo_model {
     struct ggml_context * ctx_w;          // weights context
     ggml_backend_t backend;
     ggml_backend_buffer_t buffer_w;
+    nemo_backend_type backend_type;       // which backend is in use
 
     // Tensor name mapping for loading
     std::map<std::string, struct ggml_tensor *> tensors;
@@ -200,16 +212,24 @@ struct nemo_context {
     // Audio preprocessor (optional, for audio input)
     struct nemo_preprocessor * preprocessor = nullptr;
 
-    // Number of threads for computation
+    // Number of threads for computation (CPU backend only)
     int n_threads = 4;
 };
 
 // API functions
+// Initialize with automatic backend selection (prefers CUDA if available)
 struct nemo_context * nemo_init(const char * model_path);
+
+// Initialize with specific backend
+struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backend_type backend);
+
 void nemo_free(struct nemo_context * ctx);
 
-// Load model weights from file
-bool nemo_model_load(const std::string & path, nemo_model & model);
+// Get current backend name
+const char * nemo_get_backend_name(struct nemo_context * ctx);
+
+// Load model weights from file (with backend selection)
+bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_type backend = NEMO_BACKEND_AUTO);
 
 // Build computation graphs
 struct ggml_cgraph * nemo_build_encoder_graph(
@@ -249,6 +269,31 @@ struct ggml_tensor * build_conv_subsampling(
     struct ggml_context * ctx,
     struct ggml_tensor * mel,           // [n_mels, time, batch]
     nemo_conv_subsampling * subsampling // weights
+);
+
+// Build decoder step: embedding + 2-layer LSTM
+// token_emb: [hidden_size] token embedding
+// h_in, c_in: [2 * hidden_size] concatenated LSTM states
+// Returns: decoder output [hidden_size], and updated h_out, c_out
+struct ggml_tensor * build_decoder_step(
+    struct ggml_context * ctx,
+    struct ggml_tensor * token_emb,     // [hidden_size] token embedding
+    struct ggml_tensor * h_in,          // [2 * hidden_size]
+    struct ggml_tensor * c_in,          // [2 * hidden_size]
+    nemo_decoder * decoder,
+    struct ggml_tensor ** h_out,        // output: [2 * hidden_size]
+    struct ggml_tensor ** c_out         // output: [2 * hidden_size]
+);
+
+// Build joint network: encoder_out + decoder_out -> logits
+// encoder_out: [d_model] or [d_model, 1]
+// decoder_out: [hidden_size]
+// Returns: [vocab_size] logits
+struct ggml_tensor * build_joint(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,   // [d_model] or [d_model, 1]
+    struct ggml_tensor * decoder_out,   // [hidden_size]
+    nemo_joint * joint
 );
 
 // Build full encoder: ConvSubsampling + 24 Conformer layers

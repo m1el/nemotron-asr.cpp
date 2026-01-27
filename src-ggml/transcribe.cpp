@@ -14,14 +14,17 @@
 #include <vector>
 
 static void print_usage(const char * prog) {
-    fprintf(stderr, "Usage: %s <model.gguf> <input_file> [--mel]\n", prog);
+    fprintf(stderr, "Usage: %s <model.gguf> <input_file> [--mel] [--cpu|--cuda]\n", prog);
     fprintf(stderr, "\n");
     fprintf(stderr, "  model.gguf  - GGUF model file (convert with scripts/convert_to_gguf.py)\n");
     fprintf(stderr, "  input_file  - Audio file (PCM i16le 16kHz mono) or mel spectrogram\n");
     fprintf(stderr, "  --mel       - Input is mel spectrogram [time, 128] float32 (optional)\n");
+    fprintf(stderr, "  --cpu       - Force CPU backend\n");
+    fprintf(stderr, "  --cuda      - Force CUDA backend\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s weights/model.gguf audio.pcm          # PCM audio input\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm          # PCM audio input (auto backend)\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm --cuda   # Force CUDA backend\n", prog);
     fprintf(stderr, "  %s weights/model.gguf test.mel.bin --mel # Mel spectrogram input\n", prog);
 }
 
@@ -34,14 +37,24 @@ int main(int argc, char ** argv) {
     const char * model_path = argv[1];
     const char * input_path = argv[2];
 
+    // Parse optional args
+    nemo_backend_type backend = NEMO_BACKEND_AUTO;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--cpu") == 0) {
+            backend = NEMO_BACKEND_CPU;
+        } else if (strcmp(argv[i], "--cuda") == 0) {
+            backend = NEMO_BACKEND_CUDA;
+        }
+    }
+
     // Load model
     printf("Loading model from %s...\n", model_path);
-    struct nemo_context * ctx = nemo_init(model_path);
+    struct nemo_context * ctx = nemo_init_with_backend(model_path, backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
-    printf("Model loaded successfully.\n");
+    printf("Model loaded successfully (backend: %s)\n", nemo_get_backend_name(ctx));
 
     // Load input file
     FILE * f = fopen(input_path, "rb");

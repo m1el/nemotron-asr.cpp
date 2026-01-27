@@ -14,6 +14,10 @@
 #include <cmath>
 #include <cstring>
 
+// Use CPU backend by default for tests (for numerical comparison with reference)
+// Set to NEMO_BACKEND_AUTO or NEMO_BACKEND_CUDA to test GPU
+static nemo_backend_type g_test_backend = NEMO_BACKEND_CPU;
+
 // Helper to accumulate error statistics
 struct error_calc {
     float max_diff = 0.0f;
@@ -59,7 +63,7 @@ bool test_linear() {
     }
 
     // Load ggml weights
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -177,7 +181,7 @@ bool test_layer_norm() {
     }
 
     // Load ggml weights
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -289,7 +293,7 @@ bool test_swish() {
     printf("=== Testing Swish/SiLU Activation ===\n");
 
     // Load ggml weights (just for backend)
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -382,7 +386,7 @@ bool test_ffn() {
     }
 
     // Load ggml weights
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -512,7 +516,7 @@ bool test_conv2d() {
     }
 
     // Load ggml weights
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -753,7 +757,7 @@ bool test_conv_subsampling() {
     }
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -1004,7 +1008,7 @@ bool test_rel_shift() {
     printf("=== Testing rel_shift ===\n");
 
     // Load ggml model for backend
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -1173,7 +1177,7 @@ bool test_mha() {
     }
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -1260,7 +1264,7 @@ bool test_pos_encoding() {
     printf("=== Testing Positional Encoding ===\n");
 
     // Load ggml model (which has precomputed pos_emb)
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -1369,7 +1373,7 @@ bool test_conformer_conv() {
     }
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -1456,10 +1460,10 @@ bool test_conformer_conv() {
     size_t nb1 = full_ch * sizeof(float);  // stride to next time step
     size_t nb2 = full_ch * seq_len * sizeof(float);  // stride to next batch
 
-    struct ggml_tensor * glu_a = ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
-                                              nb1, nb2, 0);
-    struct ggml_tensor * glu_b = ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
-                                              nb1, nb2, half_ch * sizeof(float));
+    struct ggml_tensor * glu_a = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
+                                              nb1, nb2, 0));
+    struct ggml_tensor * glu_b = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, half_ch, seq_len, batch,
+                                              nb1, nb2, half_ch * sizeof(float)));
     cur = ggml_mul(ctx0, glu_a, ggml_sigmoid(ctx0, glu_b));
     // cur: [1024, seq_len, batch]
 
@@ -1742,7 +1746,7 @@ bool test_mha_full() {
     }
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2001,7 +2005,7 @@ bool test_conformer_layer() {
     }
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2156,7 +2160,7 @@ bool test_encoder() {
     printf("=== Testing Full Encoder ===\n");
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2379,7 +2383,7 @@ bool test_decoder() {
     printf("=== Testing Decoder (LSTM) ===\n");
 
     // Load models
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2525,7 +2529,7 @@ bool test_joint() {
     printf("=== Testing Joint Network ===\n");
 
     // Load models
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2646,7 +2650,7 @@ bool test_greedy_decode() {
     printf("=== Testing Greedy Decode (Full Pipeline) ===\n");
 
     // Load ggml model
-    nemo_context * ctx = nemo_init("weights/model.gguf");
+    nemo_context * ctx = nemo_init_with_backend("weights/model.gguf", g_test_backend);
     if (!ctx) {
         fprintf(stderr, "Failed to load ggml model\n");
         return false;
@@ -2847,6 +2851,28 @@ static TestEntry tests[] = {
 };
 
 int main(int argc, char ** argv) {
+    // Check for backend selection flag
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--cuda") == 0) {
+            g_test_backend = NEMO_BACKEND_CUDA;
+            printf("Using CUDA backend for tests\n");
+            // Remove this arg from consideration
+            for (int j = i; j < argc - 1; j++) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            i--;
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            g_test_backend = NEMO_BACKEND_CPU;
+            printf("Using CPU backend for tests\n");
+            for (int j = i; j < argc - 1; j++) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+            i--;
+        }
+    }
+
     printf("=== Testing GGML Computation vs Original ===\n\n");
 
     int passed = 0;

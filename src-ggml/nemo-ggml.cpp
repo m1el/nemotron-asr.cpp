@@ -29,13 +29,51 @@ static void compute_pos_emb(float * data, int max_len, int d_model) {
     }
 }
 
-bool nemo_model_load(const std::string & path, nemo_model & model) {
+// Initialize backend based on requested type
+static bool init_backend(nemo_model & model, nemo_backend_type backend_type) {
+    model.backend = nullptr;
+    model.backend_type = NEMO_BACKEND_CPU;  // default
+
+#ifdef GGML_USE_CUDA
+    if (backend_type == NEMO_BACKEND_CUDA || backend_type == NEMO_BACKEND_AUTO) {
+        int n_devices = ggml_backend_cuda_get_device_count();
+        if (n_devices > 0) {
+            model.backend = ggml_backend_cuda_init(0);  // use first CUDA device
+            if (model.backend) {
+                model.backend_type = NEMO_BACKEND_CUDA;
+                char desc[256];
+                ggml_backend_cuda_get_device_description(0, desc, sizeof(desc));
+                printf("%s: using CUDA backend (%s)\n", __func__, desc);
+
+                size_t free_mem, total_mem;
+                ggml_backend_cuda_get_device_memory(0, &free_mem, &total_mem);
+                printf("%s: CUDA memory: %.1f / %.1f GB available\n", __func__,
+                       free_mem / 1e9, total_mem / 1e9);
+            }
+        }
+    }
+#endif
+
+    // Fall back to CPU if CUDA not available or not requested
+    if (!model.backend) {
+        if (backend_type == NEMO_BACKEND_CUDA) {
+            fprintf(stderr, "%s: CUDA backend requested but not available\n", __func__);
+            return false;
+        }
+        model.backend = ggml_backend_cpu_init();
+        model.backend_type = NEMO_BACKEND_CPU;
+        printf("%s: using CPU backend\n", __func__);
+    }
+
+    return model.backend != nullptr;
+}
+
+bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_type backend_type) {
     // printf("%s: loading model from '%s'\n", __func__, path.c_str());
 
-    // Initialize backend first
-    model.backend = ggml_backend_cpu_init();
-    if (!model.backend) {
-        fprintf(stderr, "%s: failed to init CPU backend\n", __func__);
+    // Initialize backend
+    if (!init_backend(model, backend_type)) {
+        fprintf(stderr, "%s: failed to initialize backend\n", __func__);
         return false;
     }
 
@@ -141,7 +179,9 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     }
 
     // Add positional embedding tensor (precomputed)
-    const int max_pos_len = 512;
+    // max_pos_len determines max audio length: max_pos_len * 8 * 10ms = max_audio_ms
+    // 1024 -> ~82 seconds, 2048 -> ~164 seconds
+    const int max_pos_len = 2048;
     model.pos_emb = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32,
                                         model.hparams.d_model, 2 * max_pos_len - 1);
     ggml_set_name(model.pos_emb, "pos_emb");
@@ -324,9 +364,13 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
 }
 
 struct nemo_context * nemo_init(const char * model_path) {
+    return nemo_init_with_backend(model_path, NEMO_BACKEND_AUTO);
+}
+
+struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backend_type backend) {
     struct nemo_context * ctx = new nemo_context();
 
-    if (!nemo_model_load(model_path, ctx->model)) {
+    if (!nemo_model_load(model_path, ctx->model, backend)) {
         delete ctx;
         return nullptr;
     }
@@ -362,6 +406,15 @@ struct nemo_context * nemo_init(const char * model_path) {
     }
 
     return ctx;
+}
+
+const char * nemo_get_backend_name(struct nemo_context * ctx) {
+    if (!ctx) return "unknown";
+    switch (ctx->model.backend_type) {
+        case NEMO_BACKEND_CUDA: return "CUDA";
+        case NEMO_BACKEND_CPU:  return "CPU";
+        default: return "unknown";
+    }
 }
 
 void nemo_free(struct nemo_context * ctx) {
@@ -445,10 +498,11 @@ static void build_lstm_cell(
     gates = ggml_add(ctx, gates, b_hh);
 
     // Split gates: [i, f, g, o] each of size hidden_size
-    struct ggml_tensor * i_gate = ggml_view_1d(ctx, gates, hidden_size, 0 * hidden_size * sizeof(float));
-    struct ggml_tensor * f_gate = ggml_view_1d(ctx, gates, hidden_size, 1 * hidden_size * sizeof(float));
-    struct ggml_tensor * g_gate = ggml_view_1d(ctx, gates, hidden_size, 2 * hidden_size * sizeof(float));
-    struct ggml_tensor * o_gate = ggml_view_1d(ctx, gates, hidden_size, 3 * hidden_size * sizeof(float));
+    // Use ggml_cont to make views contiguous (required for CUDA backend)
+    struct ggml_tensor * i_gate = ggml_cont(ctx, ggml_view_1d(ctx, gates, hidden_size, 0 * hidden_size * sizeof(float)));
+    struct ggml_tensor * f_gate = ggml_cont(ctx, ggml_view_1d(ctx, gates, hidden_size, 1 * hidden_size * sizeof(float)));
+    struct ggml_tensor * g_gate = ggml_cont(ctx, ggml_view_1d(ctx, gates, hidden_size, 2 * hidden_size * sizeof(float)));
+    struct ggml_tensor * o_gate = ggml_cont(ctx, ggml_view_1d(ctx, gates, hidden_size, 3 * hidden_size * sizeof(float)));
 
     // Apply activations
     i_gate = ggml_sigmoid(ctx, i_gate);
@@ -628,8 +682,8 @@ static struct ggml_tensor * build_conformer_conv(
     size_t nb1 = full_ch * sizeof(float);
     size_t nb2 = full_ch * seq_len * sizeof(float);
 
-    struct ggml_tensor * glu_a = ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, 0);
-    struct ggml_tensor * glu_b = ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, half_ch * sizeof(float));
+    struct ggml_tensor * glu_a = ggml_cont(ctx, ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, 0));
+    struct ggml_tensor * glu_b = ggml_cont(ctx, ggml_view_3d(ctx, cur, half_ch, seq_len, batch, nb1, nb2, half_ch * sizeof(float)));
     cur = ggml_mul(ctx, glu_a, ggml_sigmoid(ctx, glu_b));
     cur = ggml_cont(ctx, cur);
 
