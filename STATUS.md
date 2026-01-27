@@ -8,7 +8,7 @@
 
 The C++ port of NVIDIA's NeMo ASR model (nemotron-speech-streaming-en-0.6b) is fully functional and produces correct transcriptions.
 
-### GGML Port: Phase 8 Complete
+### GGML Port: Phase 11 Complete
 
 #### Phase 1: Infrastructure (COMPLETE)
 - GGUF conversion script: `scripts/convert_to_gguf.py`
@@ -114,13 +114,44 @@ Fixed bugs:
 - Positional embedding storage order (was ascending, now descending to match NeMo)
 - Kernel size inference from weight tensor (was defaulting to 31, now correctly infers 9)
 
-#### Remaining Phases:
-- Phase 9: RNNT Decoder (LSTM)
-- Phase 10: Joint Network
-- Phase 11: Greedy Decode
-- Phase 12: Full Pipeline
+#### Phase 9: RNNT Decoder (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Decoder (2-layer LSTM) | PASS | 1.2e-06 |
 
-### Test Summary (13/13 PASS)
+Key implementation notes:
+- `build_decoder_step()`: Embedding lookup + 2-layer LSTM
+- `build_lstm_cell()`: Standard LSTM cell with gates [i, f, g, o]
+- Hidden state passed through both layers sequentially
+- Decoder output is final LSTM hidden state (640 dim)
+- Embedding: [640, 1025], LSTM weights: [2560, 640] per layer
+
+#### Phase 10: Joint Network (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Joint Network | PASS | 6.9e-05 |
+
+Key implementation notes:
+- `build_joint()`: enc_proj + dec_proj → ReLU → vocab_proj
+- Encoder projection: [1024] → [640]
+- Decoder projection: [640] → [640]
+- Output projection: [640] → [1025]
+
+#### Phase 11: Greedy Decode (COMPLETE)
+| Test | Status | Result |
+|------|--------|--------|
+| Greedy Decode | PASS | 121/121 tokens match |
+
+Key implementation notes:
+- `greedy_decode()`: Full RNN-T decoding loop
+- For each encoder time step, predict until blank
+- LSTM state only updated when emitting non-blank tokens
+- Uses vocabulary from GGUF for text decoding
+
+#### Remaining Phases:
+- Phase 12: Full Pipeline Integration (API cleanup)
+
+### Test Summary (16/16 PASS)
 ```
 linear          PASS  (2.3e-05)
 layer_norm      PASS  (1.7e-06)
@@ -135,6 +166,9 @@ mha_full        PASS  (7.8e-04)
 conformer_conv  PASS  (8.9e-04)
 conformer_layer PASS  (2.4e-04)
 encoder         PASS  (4.5e-05)
+decoder         PASS  (1.2e-06)
+joint           PASS  (6.9e-05)
+greedy_decode   PASS  (exact match)
 ```
 
 ### File Structure
@@ -146,7 +180,7 @@ nemotron-speech.cpp/
 │   └── nemo-ggml.cpp        # Weight loading + graph builders
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
-│   └── test_compute.cpp     # Computation verification (13/13 PASS)
+│   └── test_compute.cpp     # Computation verification (16/16 PASS)
 ├── scripts/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/

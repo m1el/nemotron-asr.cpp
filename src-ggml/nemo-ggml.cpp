@@ -82,13 +82,15 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     if (kv_idx >= 0) model.hparams.joint_dim = gguf_get_val_u32(gguf_ctx, kv_idx);
 
     // Load vocabulary
+    // vocab is stored as a string containing vocab_size * 8 bytes (each token is a char8)
     kv_idx = gguf_find_key(gguf_ctx, "tokenizer.vocab");
     if (kv_idx >= 0) {
         const char * vocab_data = gguf_get_val_str(gguf_ctx, kv_idx);
-        size_t vocab_bytes = gguf_get_arr_n(gguf_ctx, kv_idx);
-        size_t vocab_entry_size = 8; // char8
-        size_t n_tokens = vocab_bytes / vocab_entry_size;
-        model.vocab.resize(n_tokens + 1, {0}); // +1 for empty token
+        // Use vocab_size from hparams (already loaded), each entry is 8 bytes
+        size_t n_tokens = model.hparams.vocab_size;  // 1025
+        size_t vocab_entry_size = 8;  // char8
+        size_t vocab_bytes = n_tokens * vocab_entry_size;
+        model.vocab.resize(n_tokens, {0});
         memcpy(model.vocab.data(), vocab_data, vocab_bytes);
     }
 
@@ -263,17 +265,24 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     model.encoder.final_norm_b = nullptr;
     model.encoder.fc_w = nullptr;
 
-    // Decoder
+    // Decoder (2-layer LSTM)
     model.decoder.embedding = model.tensors["decoder.prediction.embed.weight"];
-    model.decoder.lstm_w_ih = model.tensors["decoder.prediction.dec_rnn.lstm.weight_ih_l0"];
-    model.decoder.lstm_w_hh = model.tensors["decoder.prediction.dec_rnn.lstm.weight_hh_l0"];
-    model.decoder.lstm_b_ih = model.tensors["decoder.prediction.dec_rnn.lstm.bias_ih_l0"];
-    model.decoder.lstm_b_hh = model.tensors["decoder.prediction.dec_rnn.lstm.bias_hh_l0"];
-    model.decoder.fc_w = model.tensors["decoder.prediction.fc.weight"];
+    // LSTM layer 0
+    model.decoder.lstm_w_ih_l0 = model.tensors["decoder.prediction.dec_rnn.lstm.weight_ih_l0"];
+    model.decoder.lstm_w_hh_l0 = model.tensors["decoder.prediction.dec_rnn.lstm.weight_hh_l0"];
+    model.decoder.lstm_b_ih_l0 = model.tensors["decoder.prediction.dec_rnn.lstm.bias_ih_l0"];
+    model.decoder.lstm_b_hh_l0 = model.tensors["decoder.prediction.dec_rnn.lstm.bias_hh_l0"];
+    // LSTM layer 1
+    model.decoder.lstm_w_ih_l1 = model.tensors["decoder.prediction.dec_rnn.lstm.weight_ih_l1"];
+    model.decoder.lstm_w_hh_l1 = model.tensors["decoder.prediction.dec_rnn.lstm.weight_hh_l1"];
+    model.decoder.lstm_b_ih_l1 = model.tensors["decoder.prediction.dec_rnn.lstm.bias_ih_l1"];
+    model.decoder.lstm_b_hh_l1 = model.tensors["decoder.prediction.dec_rnn.lstm.bias_hh_l1"];
 
     // Joint
     model.joint.enc_w = model.tensors["joint.enc.weight"];
+    model.joint.enc_b = model.tensors["joint.enc.bias"];
     model.joint.dec_w = model.tensors["joint.pred.weight"];
+    model.joint.dec_b = model.tensors["joint.pred.bias"];
     model.joint.out_w = model.tensors["joint.joint_net.2.weight"];
     model.joint.out_b = model.tensors["joint.joint_net.2.bias"];
 
@@ -293,6 +302,10 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     check(model.encoder.subsampling.conv0_w, "encoder.pre_encode.conv.0.weight");
     check(model.encoder.subsampling.out_w, "encoder.pre_encode.out.weight");
     check(model.decoder.embedding, "decoder.prediction.embed.weight");
+    check(model.decoder.lstm_w_ih_l0, "decoder.prediction.dec_rnn.lstm.weight_ih_l0");
+    check(model.decoder.lstm_w_ih_l1, "decoder.prediction.dec_rnn.lstm.weight_ih_l1");
+    check(model.joint.enc_w, "joint.enc.weight");
+    check(model.joint.dec_w, "joint.pred.weight");
     check(model.joint.out_w, "joint.joint_net.2.weight");
 
     if (missing) {
@@ -867,4 +880,291 @@ struct ggml_tensor * build_encoder(
     }
 
     return cur;  // [d_model, time/8, batch]
+}
+
+// ============================================================================
+// Decoder (RNNT Prediction Network)
+// ============================================================================
+
+// Build decoder step: embedding + 2-layer LSTM
+// token: input token id
+// h_in: [2 * hidden_size] concatenated hidden states for both layers
+// c_in: [2 * hidden_size] concatenated cell states for both layers
+// Returns: decoder output [hidden_size], and updated h_out, c_out
+struct ggml_tensor * build_decoder_step(
+    struct ggml_context * ctx,
+    struct ggml_tensor * token_emb,     // [hidden_size] token embedding
+    struct ggml_tensor * h_in,          // [2 * hidden_size]
+    struct ggml_tensor * c_in,          // [2 * hidden_size]
+    nemo_decoder * decoder,
+    struct ggml_tensor ** h_out,        // output: [2 * hidden_size]
+    struct ggml_tensor ** c_out         // output: [2 * hidden_size]
+) {
+    const int64_t hidden_size = nemo_decoder::HIDDEN_SIZE;  // 640
+
+    // Split input states into per-layer states
+    struct ggml_tensor * h0_in = ggml_view_1d(ctx, h_in, hidden_size, 0);
+    struct ggml_tensor * c0_in = ggml_view_1d(ctx, c_in, hidden_size, 0);
+    struct ggml_tensor * h1_in = ggml_view_1d(ctx, h_in, hidden_size, hidden_size * sizeof(float));
+    struct ggml_tensor * c1_in = ggml_view_1d(ctx, c_in, hidden_size, hidden_size * sizeof(float));
+
+    // Layer 0: input is token embedding
+    struct ggml_tensor * h0_out = nullptr;
+    struct ggml_tensor * c0_out = nullptr;
+    build_lstm_cell(ctx, token_emb, h0_in, c0_in,
+                    decoder->lstm_w_ih_l0, decoder->lstm_w_hh_l0,
+                    decoder->lstm_b_ih_l0, decoder->lstm_b_hh_l0,
+                    &h0_out, &c0_out);
+
+    // Layer 1: input is h0_out
+    struct ggml_tensor * h1_out = nullptr;
+    struct ggml_tensor * c1_out = nullptr;
+    build_lstm_cell(ctx, h0_out, h1_in, c1_in,
+                    decoder->lstm_w_ih_l1, decoder->lstm_w_hh_l1,
+                    decoder->lstm_b_ih_l1, decoder->lstm_b_hh_l1,
+                    &h1_out, &c1_out);
+
+    // Concatenate output states
+    *h_out = ggml_concat(ctx, h0_out, h1_out, 0);  // [2 * hidden_size]
+    *c_out = ggml_concat(ctx, c0_out, c1_out, 0);  // [2 * hidden_size]
+
+    // Decoder output is the hidden state of the last layer
+    return h1_out;  // [hidden_size]
+}
+
+// Embedding lookup using ggml_get_rows
+// token_id: scalar token ID
+// Returns: [hidden_size] embedding vector
+static struct ggml_tensor * build_embedding_lookup(
+    struct ggml_context * ctx,
+    int token_id,
+    struct ggml_tensor * embedding   // [hidden_size, vocab_size] in GGML layout
+) {
+    // Create index tensor
+    struct ggml_tensor * idx = ggml_new_i32(ctx, token_id);
+
+    // ggml_get_rows expects embedding in [hidden_size, vocab_size] layout
+    // and returns [hidden_size, n_rows]
+    struct ggml_tensor * emb = ggml_get_rows(ctx, embedding, idx);
+
+    // Reshape to [hidden_size]
+    return ggml_reshape_1d(ctx, emb, embedding->ne[0]);
+}
+
+// ============================================================================
+// Joint Network
+// ============================================================================
+
+// Build joint network: encoder_out + decoder_out -> logits
+// encoder_out: [d_model] or [d_model, time] single frame or multiple frames
+// decoder_out: [hidden_size]
+// Returns: [vocab_size] logits
+struct ggml_tensor * build_joint(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,   // [d_model] or [d_model, 1]
+    struct ggml_tensor * decoder_out,   // [hidden_size]
+    nemo_joint * joint
+) {
+    // Ensure encoder_out is 1D [d_model]
+    struct ggml_tensor * enc = encoder_out;
+    if (enc->ne[1] > 1 || enc->ne[2] > 1) {
+        // Multiple time steps or batch, reshape to just the first element
+        enc = ggml_view_1d(ctx, enc, enc->ne[0], 0);
+    } else if (enc->ne[1] == 1) {
+        // [d_model, 1] -> [d_model]
+        enc = ggml_reshape_1d(ctx, enc, enc->ne[0]);
+    }
+
+    // Project encoder: [d_model] -> [joint_dim]
+    // enc_w is [joint_dim, d_model], mul_mat computes enc @ enc_w.T = [joint_dim]
+    struct ggml_tensor * enc_proj = ggml_mul_mat(ctx, joint->enc_w, enc);
+    enc_proj = ggml_add(ctx, enc_proj, joint->enc_b);
+
+    // Project decoder: [hidden_size] -> [joint_dim]
+    struct ggml_tensor * dec_proj = ggml_mul_mat(ctx, joint->dec_w, decoder_out);
+    dec_proj = ggml_add(ctx, dec_proj, joint->dec_b);
+
+    // Add and ReLU
+    struct ggml_tensor * joint_out = ggml_add(ctx, enc_proj, dec_proj);
+    joint_out = ggml_relu(ctx, joint_out);
+
+    // Output projection: [joint_dim] -> [vocab_size]
+    struct ggml_tensor * logits = ggml_mul_mat(ctx, joint->out_w, joint_out);
+    logits = ggml_add(ctx, logits, joint->out_b);
+
+    return logits;  // [vocab_size]
+}
+
+// ============================================================================
+// Greedy Decoding
+// ============================================================================
+
+// Run greedy RNN-T decoding
+// encoder_out: [d_model, time, batch] - output from build_encoder
+// Returns: vector of token IDs
+std::vector<int> greedy_decode(
+    struct nemo_context * nctx,
+    struct ggml_tensor * encoder_out,  // [d_model, time, batch]
+    ggml_backend_t backend
+) {
+    std::vector<int> tokens;
+
+    const int d_model = encoder_out->ne[0];       // 1024
+    const int time_steps = encoder_out->ne[1];
+    const int hidden_size = nemo_decoder::HIDDEN_SIZE;  // 640
+    const int num_layers = nemo_decoder::NUM_LAYERS;    // 2
+    const int vocab_size = nctx->model.hparams.vocab_size;  // 1025
+    const int blank_token = vocab_size - 1;  // 1024
+
+    // Get encoder data to CPU
+    std::vector<float> enc_data(d_model * time_steps);
+    ggml_backend_tensor_get(encoder_out, enc_data.data(), 0, enc_data.size() * sizeof(float));
+
+    // Initialize decoder state
+    std::vector<float> h_state(num_layers * hidden_size, 0.0f);
+    std::vector<float> c_state(num_layers * hidden_size, 0.0f);
+
+    int prev_token = blank_token;
+
+    // Max symbols per step (prevent infinite loops)
+    const int MAX_SYMBOLS_PER_STEP = 10;
+
+    bool debug = false;  // Set to true for debug output
+
+    for (int t = 0; t < time_steps; t++) {
+        // Extract encoder frame at time t
+        const float * enc_frame = enc_data.data() + t * d_model;
+
+        for (int sym = 0; sym < MAX_SYMBOLS_PER_STEP; sym++) {
+            // Create compute context for this step
+            size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+            std::vector<uint8_t> compute_buf(buf_size);
+
+            struct ggml_init_params params = {
+                /*.mem_size   =*/ buf_size,
+                /*.mem_buffer =*/ compute_buf.data(),
+                /*.no_alloc   =*/ true,
+            };
+
+            struct ggml_context * ctx0 = ggml_init(params);
+            if (!ctx0) break;
+
+            // Create input tensors
+            struct ggml_tensor * h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+            struct ggml_tensor * c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+            struct ggml_tensor * token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+            struct ggml_tensor * enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_model);
+            ggml_set_input(h_in);
+            ggml_set_input(c_in);
+            ggml_set_input(token_emb);
+            ggml_set_input(enc_in);
+
+            // Build decoder step
+            struct ggml_tensor * h_out = nullptr;
+            struct ggml_tensor * c_out = nullptr;
+            struct ggml_tensor * dec_out = build_decoder_step(ctx0, token_emb, h_in, c_in,
+                                                              &nctx->model.decoder, &h_out, &c_out);
+
+            // Build joint
+            struct ggml_tensor * logits = build_joint(ctx0, enc_in, dec_out, &nctx->model.joint);
+            ggml_set_output(logits);
+            ggml_set_output(h_out);
+            ggml_set_output(c_out);
+
+            // Build graph
+            struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+            ggml_build_forward_expand(gf, logits);
+            ggml_build_forward_expand(gf, h_out);
+            ggml_build_forward_expand(gf, c_out);
+
+            // Allocate
+            ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+                ggml_gallocr_free(allocr);
+                ggml_free(ctx0);
+                break;
+            }
+
+            // Set inputs
+            ggml_backend_tensor_set(h_in, h_state.data(), 0, h_state.size() * sizeof(float));
+            ggml_backend_tensor_set(c_in, c_state.data(), 0, c_state.size() * sizeof(float));
+
+            // Get embedding for prev_token
+            std::vector<float> emb_data(hidden_size);
+            size_t emb_offset = prev_token * hidden_size * sizeof(float);
+            ggml_backend_tensor_get(nctx->model.decoder.embedding, emb_data.data(), emb_offset, hidden_size * sizeof(float));
+            ggml_backend_tensor_set(token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
+
+            ggml_backend_tensor_set(enc_in, enc_frame, 0, d_model * sizeof(float));
+
+            // Compute
+            ggml_backend_graph_compute(backend, gf);
+
+            // Get logits and find argmax
+            std::vector<float> logits_data(vocab_size);
+            ggml_backend_tensor_get(logits, logits_data.data(), 0, vocab_size * sizeof(float));
+
+            int best_token = 0;
+            float best_score = logits_data[0];
+            for (int v = 1; v < vocab_size; v++) {
+                if (logits_data[v] > best_score) {
+                    best_score = logits_data[v];
+                    best_token = v;
+                }
+            }
+
+            // Get updated state BEFORE freeing (we'll decide whether to keep it)
+            std::vector<float> new_h_state(h_state.size());
+            std::vector<float> new_c_state(c_state.size());
+            ggml_backend_tensor_get(h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
+            ggml_backend_tensor_get(c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
+
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+
+            if (debug && t < 5) {
+                printf("  t=%d sym=%d: prev_token=%d, best_token=%d (score=%.4f), blank_score=%.4f\n",
+                       t, sym, prev_token, best_token, best_score, logits_data[blank_token]);
+            }
+
+            if (best_token == blank_token) {
+                // Move to next time step - DON'T update state
+                break;
+            }
+
+            // Emit non-blank token
+            tokens.push_back(best_token);
+            prev_token = best_token;
+
+            // Only update LSTM state when emitting a non-blank token
+            h_state = std::move(new_h_state);
+            c_state = std::move(new_c_state);
+        }
+    }
+
+    if (debug) {
+        printf("Total tokens emitted: %zu\n", tokens.size());
+    }
+
+    return tokens;
+}
+
+// Convert token IDs to text
+std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab) {
+    std::string result;
+    for (int token : tokens) {
+        if (token >= 0 && token < (int)vocab.size()) {
+            std::string piece(vocab[token].data);
+            // SentencePiece convention: _ means space at start of word
+            if (!piece.empty() && piece[0] == '\xe2' && piece.size() >= 3 &&
+                piece[1] == '\x96' && piece[2] == '\x81') {
+                // UTF-8 for ▁ (U+2581)
+                if (!result.empty()) result += ' ';
+                result += piece.substr(3);
+            } else {
+                result += piece;
+            }
+        }
+    }
+    return result;
 }

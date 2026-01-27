@@ -5,6 +5,10 @@
 #include "../include/conv_subsampling.h"
 #include "../include/conformer_modules.h"
 #include "../include/conformer_encoder.h"
+#include "../include/rnnt_decoder.h"
+#include "../include/rnnt_joint.h"
+#include "../include/greedy_decode.h"
+#include "../include/tokenizer.h"
 
 #include <cstdio>
 #include <cmath>
@@ -2345,6 +2349,476 @@ bool test_encoder() {
     return passed;
 }
 
+// Forward declare build functions from nemo-ggml.cpp
+struct ggml_tensor * build_decoder_step(
+    struct ggml_context * ctx,
+    struct ggml_tensor * token_emb,
+    struct ggml_tensor * h_in,
+    struct ggml_tensor * c_in,
+    nemo_decoder * decoder,
+    struct ggml_tensor ** h_out,
+    struct ggml_tensor ** c_out
+);
+
+struct ggml_tensor * build_joint(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,
+    struct ggml_tensor * decoder_out,
+    nemo_joint * joint
+);
+
+std::vector<int> greedy_decode(
+    struct nemo_context * nctx,
+    struct ggml_tensor * encoder_out,
+    ggml_backend_t backend
+);
+
+std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab);
+
+bool test_decoder() {
+    printf("=== Testing Decoder (LSTM) ===\n");
+
+    // Load models
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    nemo::RNNTDecoder ref_decoder;
+    ref_decoder.load_weights(ref_weights);
+    ref_decoder.init_state(1);
+
+    const int hidden_size = 640;
+    const int num_layers = 2;
+
+    // Test with a few different tokens
+    int test_tokens[] = {1024, 0, 100, 500};  // blank, then some tokens
+    bool all_passed = true;
+
+    for (int test_idx = 0; test_idx < 4; test_idx++) {
+        int token = test_tokens[test_idx];
+        printf("Testing token %d...\n", token);
+
+        // Reference decoder forward
+        nemo::TensorF ref_output;
+        ref_decoder.forward_step(token, ref_output);
+
+        printf("  Reference output[0:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+               ref_output(0, 0), ref_output(0, 1), ref_output(0, 2),
+               ref_output(0, 3), ref_output(0, 4));
+
+        // === GGML implementation ===
+        size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+        std::vector<uint8_t> compute_buf(buf_size);
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ buf_size,
+            /*.mem_buffer =*/ compute_buf.data(),
+            /*.no_alloc   =*/ true,
+        };
+
+        struct ggml_context * ctx0 = ggml_init(params);
+        if (!ctx0) {
+            fprintf(stderr, "Failed to init ggml context\n");
+            nemo_free(ctx);
+            return false;
+        }
+
+        // Create input tensors
+        struct ggml_tensor * h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+        struct ggml_tensor * c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+        struct ggml_tensor * token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+        ggml_set_name(h_in, "h_in");
+        ggml_set_name(c_in, "c_in");
+        ggml_set_name(token_emb, "token_emb");
+        ggml_set_input(h_in);
+        ggml_set_input(c_in);
+        ggml_set_input(token_emb);
+
+        // Build decoder step graph
+        struct ggml_tensor * h_out = nullptr;
+        struct ggml_tensor * c_out = nullptr;
+        struct ggml_tensor * dec_out = build_decoder_step(ctx0, token_emb, h_in, c_in,
+                                                          &ctx->model.decoder, &h_out, &c_out);
+        ggml_set_name(dec_out, "decoder_output");
+        ggml_set_output(dec_out);
+        ggml_set_output(h_out);
+        ggml_set_output(c_out);
+
+        // Build graph
+        struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, dec_out);
+        ggml_build_forward_expand(gf, h_out);
+        ggml_build_forward_expand(gf, c_out);
+
+        // Allocate
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "Failed to allocate graph\n");
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+            nemo_free(ctx);
+            return false;
+        }
+
+        // Set inputs - get current state from reference decoder
+        std::vector<float> h_data(num_layers * hidden_size);
+        std::vector<float> c_data(num_layers * hidden_size);
+
+        // Copy state from reference decoder (before this step)
+        // Note: we need to save state before ref_decoder.forward_step
+        // For simplicity, we use GGML state that tracks across tests
+        ggml_backend_tensor_set(h_in, ctx->state.h.data(), 0, h_data.size() * sizeof(float));
+        ggml_backend_tensor_set(c_in, ctx->state.c.data(), 0, c_data.size() * sizeof(float));
+
+        // Get token embedding from model
+        std::vector<float> emb_data(hidden_size);
+        // embedding tensor is [hidden_size, vocab_size] in GGML layout
+        size_t emb_offset = token * hidden_size * sizeof(float);
+        ggml_backend_tensor_get(ctx->model.decoder.embedding, emb_data.data(), emb_offset, hidden_size * sizeof(float));
+        ggml_backend_tensor_set(token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
+
+        // Compute
+        ggml_backend_graph_compute(ctx->model.backend, gf);
+
+        // Get output
+        std::vector<float> ggml_out(hidden_size);
+        ggml_backend_tensor_get(dec_out, ggml_out.data(), 0, hidden_size * sizeof(float));
+
+        printf("  GGML output[0:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+               ggml_out[0], ggml_out[1], ggml_out[2], ggml_out[3], ggml_out[4]);
+
+        // Compare
+        error_calc err;
+        for (int i = 0; i < hidden_size; i++) {
+            err.add(ggml_out[i], ref_output(0, i));
+        }
+        err.report("  Decoder step");
+
+        // Update GGML state for next iteration
+        ggml_backend_tensor_get(h_out, ctx->state.h.data(), 0, num_layers * hidden_size * sizeof(float));
+        ggml_backend_tensor_get(c_out, ctx->state.c.data(), 0, num_layers * hidden_size * sizeof(float));
+
+        bool passed = err.max_diff < 1e-4f;
+        printf("  Token %d: %s\n", token, passed ? "PASS" : "FAIL");
+        if (!passed) all_passed = false;
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+    }
+
+    nemo_free(ctx);
+
+    printf("Decoder test: %s\n\n", all_passed ? "PASS" : "FAIL");
+    return all_passed;
+}
+
+bool test_joint() {
+    printf("=== Testing Joint Network ===\n");
+
+    // Load models
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    nemo::RNNTJoint ref_joint;
+    ref_joint.load_weights(ref_weights);
+
+    const int encoder_dim = 1024;
+    const int decoder_dim = 640;
+    const int vocab_size = 1025;
+
+    // Create test inputs
+    nemo::TensorF enc_input({1, encoder_dim});
+    nemo::TensorF dec_input({1, decoder_dim});
+
+    // Fill with test values
+    for (int i = 0; i < encoder_dim; i++) {
+        enc_input(0, i) = 0.1f * std::sin((float)i * 0.1f);
+    }
+    for (int i = 0; i < decoder_dim; i++) {
+        dec_input(0, i) = 0.1f * std::cos((float)i * 0.1f);
+    }
+
+    // Reference forward
+    nemo::TensorF ref_logits;
+    ref_joint.forward(enc_input, dec_input, ref_logits);
+
+    printf("Reference logits[0:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_logits(0, 0), ref_logits(0, 1), ref_logits(0, 2),
+           ref_logits(0, 3), ref_logits(0, 4));
+
+    // === GGML implementation ===
+    size_t buf_size = ggml_tensor_overhead() * 50 + ggml_graph_overhead();
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "Failed to init ggml context\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create input tensors
+    struct ggml_tensor * enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, encoder_dim);
+    struct ggml_tensor * dec_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, decoder_dim);
+    ggml_set_name(enc_in, "encoder_input");
+    ggml_set_name(dec_in, "decoder_input");
+    ggml_set_input(enc_in);
+    ggml_set_input(dec_in);
+
+    // Build joint graph
+    struct ggml_tensor * logits = build_joint(ctx0, enc_in, dec_in, &ctx->model.joint);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, logits);
+
+    printf("Graph nodes: %d\n", ggml_graph_n_nodes(gf));
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "Failed to allocate graph\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(enc_in, enc_input.data.data(), 0, encoder_dim * sizeof(float));
+    ggml_backend_tensor_set(dec_in, dec_input.data.data(), 0, decoder_dim * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output
+    std::vector<float> ggml_logits(vocab_size);
+    ggml_backend_tensor_get(logits, ggml_logits.data(), 0, vocab_size * sizeof(float));
+
+    printf("GGML logits[0:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_logits[0], ggml_logits[1], ggml_logits[2], ggml_logits[3], ggml_logits[4]);
+
+    // Compare
+    error_calc err;
+    for (int i = 0; i < vocab_size; i++) {
+        err.add(ggml_logits[i], ref_logits(0, i));
+    }
+    err.report("Joint network");
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = err.max_diff < 1e-4f;
+    printf("Joint test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+bool test_greedy_decode() {
+    printf("=== Testing Greedy Decode (Full Pipeline) ===\n");
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    // Load reference implementation
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    nemo::ASRPipeline ref_pipeline;
+    ref_pipeline.load_weights(ref_weights);
+
+    // Load mel input
+    FILE * f = fopen("test.mel.bin", "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open test.mel.bin\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    size_t batch = 1;
+    size_t features = 128;
+    size_t time_in = file_size / (sizeof(float) * features);
+
+    printf("Mel input shape: [%zu, %zu, %zu]\n", batch, time_in, features);
+
+    std::vector<float> raw_mel(time_in * features);
+    fread(raw_mel.data(), sizeof(float), raw_mel.size(), f);
+    fclose(f);
+
+    // Reference transcription
+    nemo::TensorF mel_input({batch, time_in, features});
+    for (size_t t = 0; t < time_in; t++) {
+        for (size_t ff = 0; ff < features; ff++) {
+            mel_input(0, t, ff) = raw_mel[t * features + ff];
+        }
+    }
+
+    std::vector<int> ref_tokens = ref_pipeline.transcribe(mel_input);
+    printf("Reference tokens (%zu): ", ref_tokens.size());
+    for (size_t i = 0; i < std::min(ref_tokens.size(), (size_t)20); i++) {
+        printf("%d ", ref_tokens[i]);
+    }
+    if (ref_tokens.size() > 20) printf("...");
+    printf("\n");
+
+    // Print some sample vocab entries from the GGML model
+    printf("Sample vocab entries from GGUF (vocab.size=%zu):\n", ctx->model.vocab.size());
+    for (int i : {0, 1, 2, 130, 500, 1024}) {
+        if (i < (int)ctx->model.vocab.size()) {
+            printf("  vocab[%d] = '", i);
+            for (int j = 0; j < 8 && ctx->model.vocab[i].data[j]; j++) {
+                printf("%c", ctx->model.vocab[i].data[j]);
+            }
+            printf("' (hex:");
+            for (int j = 0; j < 8; j++) {
+                printf(" %02x", (unsigned char)ctx->model.vocab[i].data[j]);
+            }
+            printf(")\n");
+        }
+    }
+
+    // Decode using GGML's vocab
+    std::string ref_text = tokens_to_text(ref_tokens, ctx->model.vocab);
+    printf("Reference transcription: %s\n", ref_text.c_str());
+
+    // === GGML implementation ===
+    // First, encode the mel spectrogram
+    size_t buf_size = ggml_tensor_overhead() * 8000 + ggml_graph_overhead() * 4;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "Failed to init ggml context\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create mel input tensor [n_mels, time, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, features, time_in, batch);
+    ggml_set_name(inp, "mel_input");
+    ggml_set_input(inp);
+
+    // Build encoder graph
+    struct ggml_tensor * encoder_out = build_encoder(ctx0, inp, &ctx->model);
+    ggml_set_name(encoder_out, "encoder_output");
+    ggml_set_output(encoder_out);
+
+    // Build and allocate graph
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(gf, encoder_out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "Failed to allocate graph\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Set mel input - transpose from [batch, time, features] to [features, time, batch]
+    std::vector<float> inp_transposed(mel_input.numel());
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < time_in; t++) {
+            for (size_t ff = 0; ff < features; ff++) {
+                size_t g_idx = ff + t * features + b * features * time_in;
+                inp_transposed[g_idx] = mel_input(b, t, ff);
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Run encoder
+    printf("Computing encoder...\n");
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    printf("Encoder output shape: [%lld, %lld, %lld]\n",
+           (long long)encoder_out->ne[0], (long long)encoder_out->ne[1], (long long)encoder_out->ne[2]);
+
+    // Run greedy decode
+    printf("Running greedy decode...\n");
+    std::vector<int> ggml_tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
+
+    printf("GGML tokens (%zu): ", ggml_tokens.size());
+    for (size_t i = 0; i < std::min(ggml_tokens.size(), (size_t)20); i++) {
+        printf("%d ", ggml_tokens[i]);
+    }
+    if (ggml_tokens.size() > 20) printf("...");
+    printf("\n");
+
+    // Convert to text using same vocab
+    std::string ggml_text = tokens_to_text(ggml_tokens, ctx->model.vocab);
+    printf("GGML transcription: %s\n", ggml_text.c_str());
+
+    // Compare tokens
+    bool tokens_match = (ref_tokens.size() == ggml_tokens.size());
+    if (tokens_match) {
+        for (size_t i = 0; i < ref_tokens.size(); i++) {
+            if (ref_tokens[i] != ggml_tokens[i]) {
+                tokens_match = false;
+                printf("Token mismatch at position %zu: ref=%d, ggml=%d\n", i, ref_tokens[i], ggml_tokens[i]);
+                break;
+            }
+        }
+    } else {
+        printf("Token count mismatch: ref=%zu, ggml=%zu\n", ref_tokens.size(), ggml_tokens.size());
+    }
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    printf("Greedy decode test: %s\n\n", tokens_match ? "PASS" : "FAIL");
+    return tokens_match;
+}
+
 struct TestEntry {
     const char * name;
     bool (*func)();
@@ -2364,6 +2838,9 @@ static TestEntry tests[] = {
     {"conformer_conv", test_conformer_conv},
     {"conformer_layer", test_conformer_layer},
     {"encoder", test_encoder},
+    {"decoder", test_decoder},
+    {"joint", test_joint},
+    {"greedy_decode", test_greedy_decode},
     {nullptr, nullptr}
 };
 

@@ -101,21 +101,32 @@ struct nemo_encoder {
     struct ggml_tensor * fc_w;            // [640, 1024] encoder output projection
 };
 
-// Decoder weights
+// Decoder weights (2-layer LSTM)
 struct nemo_decoder {
-    struct ggml_tensor * embedding;       // [1024, 320]
-    struct ggml_tensor * lstm_w_ih;       // [1280, 320]
-    struct ggml_tensor * lstm_w_hh;       // [1280, 320]
-    struct ggml_tensor * lstm_b_ih;       // [1280]
-    struct ggml_tensor * lstm_b_hh;       // [1280]
-    struct ggml_tensor * fc_w;            // [640, 320]
+    static constexpr int NUM_LAYERS = 2;
+    static constexpr int HIDDEN_SIZE = 640;
+    static constexpr int EMBED_DIM = 640;
+
+    struct ggml_tensor * embedding;             // [640, 1025] (embed_dim, vocab_size)
+    // LSTM layer 0
+    struct ggml_tensor * lstm_w_ih_l0;          // [2560, 640] = [4*hidden, input]
+    struct ggml_tensor * lstm_w_hh_l0;          // [2560, 640] = [4*hidden, hidden]
+    struct ggml_tensor * lstm_b_ih_l0;          // [2560]
+    struct ggml_tensor * lstm_b_hh_l0;          // [2560]
+    // LSTM layer 1
+    struct ggml_tensor * lstm_w_ih_l1;          // [2560, 640]
+    struct ggml_tensor * lstm_w_hh_l1;          // [2560, 640]
+    struct ggml_tensor * lstm_b_ih_l1;          // [2560]
+    struct ggml_tensor * lstm_b_hh_l1;          // [2560]
 };
 
 // Joint network weights
 struct nemo_joint {
-    struct ggml_tensor * enc_w;           // [640, 640]
-    struct ggml_tensor * dec_w;           // [640, 640]
-    struct ggml_tensor * out_w;           // [1025, 640]
+    struct ggml_tensor * enc_w;           // [640, 1024] encoder projection
+    struct ggml_tensor * enc_b;           // [640]
+    struct ggml_tensor * dec_w;           // [640, 640] decoder projection
+    struct ggml_tensor * dec_b;           // [640]
+    struct ggml_tensor * out_w;           // [1025, 640] vocab projection
     struct ggml_tensor * out_b;           // [1025]
 };
 
@@ -145,21 +156,28 @@ struct nemo_model {
 
 // Runtime state for inference
 struct nemo_state {
-    // Decoder LSTM state
-    std::vector<float> h;                 // [320]
-    std::vector<float> c;                 // [320]
+    // Decoder LSTM state for 2 layers
+    static constexpr int HIDDEN_SIZE = 640;
+    static constexpr int NUM_LAYERS = 2;
+
+    std::vector<float> h;                 // [NUM_LAYERS * HIDDEN_SIZE]
+    std::vector<float> c;                 // [NUM_LAYERS * HIDDEN_SIZE]
     int prev_token;
 
     // Allocator for compute graphs
     ggml_gallocr_t allocr;
 
-    nemo_state() : h(320, 0.0f), c(320, 0.0f), prev_token(1024) {}
+    nemo_state() : h(NUM_LAYERS * HIDDEN_SIZE, 0.0f), c(NUM_LAYERS * HIDDEN_SIZE, 0.0f), prev_token(1024) {}
 
     void reset() {
         std::fill(h.begin(), h.end(), 0.0f);
         std::fill(c.begin(), c.end(), 0.0f);
         prev_token = 1024;  // blank token
     }
+
+    // Get h state for layer l
+    float * h_layer(int l) { return h.data() + l * HIDDEN_SIZE; }
+    float * c_layer(int l) { return c.data() + l * HIDDEN_SIZE; }
 };
 
 // Context combining model and state

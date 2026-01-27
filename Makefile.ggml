@@ -17,7 +17,7 @@ LDFLAGS += -lm -lpthread
 GGML_SRCS = src-ggml/nemo-ggml.cpp
 
 # Original implementation (for comparison tests)
-ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp
+ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp src/rnnt_decoder.cpp src/rnnt_joint.cpp src/greedy_decode.cpp src/tokenizer.cpp
 
 .PHONY: all clean test
 
