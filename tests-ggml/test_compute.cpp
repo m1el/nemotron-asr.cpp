@@ -1391,99 +1391,273 @@ bool test_conformer_conv() {
     cur = ggml_mul(ctx0, glu_a, ggml_sigmoid(ctx0, glu_b));
     // cur: [1024, seq_len, batch]
 
-    // Depthwise Causal Conv1d: kernel_size=9, groups=1024
-    // This is complex - depthwise conv1d with causal padding
-    // For now, let's skip the full implementation and just verify the linear parts work
-    // The depthwise conv requires special handling
-
-    // For a complete test, we'd need to implement causal depthwise conv1d
-    // Let's just verify up to GLU for now
-    struct ggml_tensor * after_glu = ggml_cont(ctx0, cur);
+    // Capture after_glu for debugging
+    struct ggml_tensor * after_glu = cur;
     ggml_set_name(after_glu, "after_glu");
     ggml_set_output(after_glu);
 
+    // Depthwise Causal Conv1d: kernel_size=9, groups=1024
+    // cur: [1024, seq_len, batch]
+    // dw_w: [9, 1, 1024] = [kernel_size, 1, channels]
+    // Causal padding: pad left by kernel_size-1 = 8
+    const int kernel_size = 9;
+    cur = ggml_cont(ctx0, cur);  // Make sure it's contiguous
+
+    // Transpose to [seq_len, 1024, batch] for conv1d
+    cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+    cur = ggml_cont(ctx0, cur);
+
+    // Apply causal padding: left = kernel_size-1 = 8, right = 0 (asymmetric)
+    cur = ggml_pad_ext(ctx0, cur, kernel_size - 1, 0, 0, 0, 0, 0, 0, 0);
+
+    // Depthwise conv1d manually: for each position t in output, sum over k:
+    // output[c, t] = sum_k input[c, t+k] * weight[c, k]
+    // Input shape after pad: [seq_len+8, d_model, batch]
+    // Weight shape: [9, 1, 1024] -> need to reshape to [9, 1024]
+    // After the conv (no trim needed since we padded exactly right): [seq_len, d_model, batch]
+
+    // Weight shape is [9, 1, 1024] with memory layout: weight[k, 0, c] at offset k + c*9
+    // Reshape to [9, 1024] for easier access
+    struct ggml_tensor * dw_w_2d = ggml_reshape_2d(ctx0, dw_w, 9, d_model);
+
+    // Transpose to [d_model, 9] so we can extract weight[:, k] easily
+    struct ggml_tensor * dw_w_t = ggml_cont(ctx0, ggml_transpose(ctx0, dw_w_2d));
+    // Now dw_w_t[c, k] = original weight[k, c] with memory: dw_w_t[c, k] at offset c + k*d_model
+
+    // Initialize output accumulator as zeros
+    // We'll do the conv by summing shifted slices
+    struct ggml_tensor * conv_result = nullptr;
+
+    for (int k = 0; k < kernel_size; k++) {
+        // Extract slice of input at offset k: [seq_len, d_model, batch]
+        struct ggml_tensor * input_slice = ggml_view_3d(ctx0, cur,
+            seq_len, d_model, batch,                           // shape
+            cur->nb[1], cur->nb[2],                            // strides
+            k * sizeof(float));                                // offset
+
+        // Get k-th kernel element for each channel from transposed weight
+        // dw_w_t is [d_model, 9], we want column k: elements [0..d_model-1, k]
+        // These are at offsets k*d_model, k*d_model+1, ..., k*d_model+d_model-1
+        struct ggml_tensor * kernel_k = ggml_view_1d(ctx0, dw_w_t, d_model, k * d_model * sizeof(float));
+
+        // Reshape to [1, d_model, 1] for broadcasting over [seq_len, d_model, batch]
+        kernel_k = ggml_reshape_3d(ctx0, kernel_k, 1, d_model, 1);
+
+        // Multiply input_slice by kernel_k (broadcast over time and batch)
+        struct ggml_tensor * product = ggml_mul(ctx0, input_slice, kernel_k);
+
+        if (conv_result == nullptr) {
+            conv_result = product;
+        } else {
+            conv_result = ggml_add(ctx0, conv_result, product);
+        }
+    }
+    cur = conv_result;
+
+    // Transpose back to [1024, seq_len, batch]
+    cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+    cur = ggml_cont(ctx0, cur);
+
+    // Capture after depthwise conv for debugging
+    struct ggml_tensor * after_dw = cur;
+    ggml_set_name(after_dw, "after_dw");
+    ggml_set_output(after_dw);
+
+    // Layer norm: weight and bias are [1024]
+    cur = ggml_norm(ctx0, cur, 1e-5f);
+    cur = ggml_mul(ctx0, cur, bn_w);
+    cur = ggml_add(ctx0, cur, bn_b);
+
+    // Capture after layer norm for debugging
+    struct ggml_tensor * after_ln = cur;
+    ggml_set_name(after_ln, "after_ln");
+    ggml_set_output(after_ln);
+
+    // Swish
+    cur = ggml_silu(ctx0, cur);
+
+    // Pointwise Conv2: [1024, seq_len, batch] -> [1024, seq_len, batch]
+    struct ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx0, pw2_w, d_model, d_model);
+    cur = ggml_mul_mat(ctx0, pw2_w_2d, cur);
+
+    // Transpose to [seq_len, 1024, batch] for output comparison
+    cur = ggml_permute(ctx0, cur, 1, 0, 2, 3);
+    struct ggml_tensor * out = ggml_cont(ctx0, cur);
+    ggml_set_name(out, "conv_module_output");
+    ggml_set_output(out);
+
     // Build graph
     struct ggml_cgraph * gf = ggml_new_graph(ctx0);
-    ggml_build_forward_expand(gf, after_glu);
+    ggml_build_forward_expand(gf, out);
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
     ggml_gallocr_alloc_graph(allocr, gf);
 
-    // Set input
-    ggml_backend_tensor_set(inp, input.data.data(), 0, input.numel() * sizeof(float));
+    // Set input - need to transpose from [batch, time, d_model] to [d_model, time, batch]
+    std::vector<float> inp_transposed(input.numel());
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                // C++ input: [batch, time, d_model] -> index = (b*time + t)*d_model + d
+                // GGML input: [d_model, time, batch] -> index = d + t*d_model + b*d_model*time
+                size_t c_idx = (b * seq_len + t) * d_model + d;
+                size_t g_idx = d + t * d_model + b * d_model * seq_len;
+                inp_transposed[g_idx] = input.data[c_idx];
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
 
     // Compute
     ggml_backend_graph_compute(ctx->model.backend, gf);
 
-    // Get output after GLU
-    std::vector<float> ggml_glu_out(half_ch * seq_len * batch);
-    ggml_backend_tensor_get(after_glu, ggml_glu_out.data(), 0, ggml_glu_out.size() * sizeof(float));
-
-    // For comparison, compute expected GLU output from original
-    // Original does: transpose -> conv1d -> transpose -> glu
-    // Let's compute the intermediate after GLU manually
-    nemo::TensorF buf1({batch, d_model, seq_len});
-    for (size_t b = 0; b < batch; b++) {
-        for (size_t t = 0; t < seq_len; t++) {
-            for (size_t d = 0; d < d_model; d++) {
-                buf1(b, d, t) = input(b, t, d);
+    // Debug: Compare GLU intermediate output with original
+    // First compute original GLU output
+    nemo::TensorF orig_after_pw1;
+    {
+        // Transpose input to [batch, d_model, time]
+        nemo::TensorF input_transposed({batch, d_model, seq_len});
+        for (size_t b = 0; b < batch; b++) {
+            for (size_t t = 0; t < seq_len; t++) {
+                for (size_t d = 0; d < d_model; d++) {
+                    input_transposed(b, d, t) = input(b, t, d);
+                }
             }
         }
+        // Pointwise conv1
+        nemo::conv1d(input_transposed,
+                     ref_weights.require("encoder.layers.0.conv.pointwise_conv1.weight").data.data(),
+                     2048, d_model, 1, 1, 0, 1, nullptr, orig_after_pw1);
+        printf("Original after pw1 shape: [%zu, %zu, %zu]\n",
+               orig_after_pw1.shape[0], orig_after_pw1.shape[1], orig_after_pw1.shape[2]);
+        printf("Original after pw1[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+               orig_after_pw1(0,0,0), orig_after_pw1(0,0,1), orig_after_pw1(0,0,2),
+               orig_after_pw1(0,0,3), orig_after_pw1(0,0,4));
+        printf("Original after pw1[0,1024,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+               orig_after_pw1(0,1024,0), orig_after_pw1(0,1024,1), orig_after_pw1(0,1024,2),
+               orig_after_pw1(0,1024,3), orig_after_pw1(0,1024,4));
     }
 
-    nemo::TensorF buf2;
-    const auto * pw1_ref = ref_weights.get("encoder.layers.0.conv.pointwise_conv1.weight");
-    if (!pw1_ref) {
-        fprintf(stderr, "pw1_ref tensor not found\n");
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx0);
-        nemo_free(ctx);
-        return false;
-    }
-    nemo::conv1d(buf1, pw1_ref->data.data(), 2048, d_model, 1, 1, 0, 1, nullptr, buf2);
+    // Get GGML after GLU output: [1024, seq_len, batch]
+    std::vector<float> ggml_glu(d_model * seq_len * batch);
+    ggml_backend_tensor_get(after_glu, ggml_glu.data(), 0, ggml_glu.size() * sizeof(float));
+    printf("GGML after GLU shape: [%lld, %lld, %lld]\n",
+           (long long)after_glu->ne[0], (long long)after_glu->ne[1], (long long)after_glu->ne[2]);
+    printf("GGML after GLU[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_glu[0], ggml_glu[1], ggml_glu[2], ggml_glu[3], ggml_glu[4]);
 
-    nemo::TensorF buf3({batch, seq_len, 2048});
+    // Compute original GLU
+    nemo::TensorF orig_pw1_transposed({batch, seq_len, 2048});
     for (size_t b = 0; b < batch; b++) {
         for (size_t t = 0; t < seq_len; t++) {
             for (size_t d = 0; d < 2048; d++) {
-                buf3(b, t, d) = buf2(b, d, t);
+                orig_pw1_transposed(b, t, d) = orig_after_pw1(b, d, t);
             }
         }
     }
-
-    nemo::TensorF ref_glu;
-    nemo::glu(buf3, ref_glu);  // [batch, time, 1024]
-
-    printf("Ref GLU output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
-           ref_glu(0,0,0), ref_glu(0,0,1), ref_glu(0,0,2), ref_glu(0,0,3), ref_glu(0,0,4));
-    printf("GGML GLU output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
-           ggml_glu_out[0], ggml_glu_out[1], ggml_glu_out[2], ggml_glu_out[3], ggml_glu_out[4]);
+    nemo::TensorF orig_after_glu;
+    nemo::glu(orig_pw1_transposed, orig_after_glu);
+    printf("Original after GLU shape: [%zu, %zu, %zu]\n",
+           orig_after_glu.shape[0], orig_after_glu.shape[1], orig_after_glu.shape[2]);
+    printf("Original after GLU[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           orig_after_glu(0,0,0), orig_after_glu(0,0,1), orig_after_glu(0,0,2),
+           orig_after_glu(0,0,3), orig_after_glu(0,0,4));
 
     // Compare GLU outputs
+    float glu_max_diff = 0.0f;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                float ref_val = orig_after_glu(b, t, d);
+                // GGML GLU: [d_model, seq_len, batch] -> index = d + t*d_model + b*d_model*seq_len
+                float ggml_val = ggml_glu[d + t * d_model + b * d_model * seq_len];
+                float diff = std::abs(ref_val - ggml_val);
+                glu_max_diff = std::max(glu_max_diff, diff);
+            }
+        }
+    }
+    printf("GLU max diff: %.6e\n", glu_max_diff);
+
+    // Compute original depthwise conv output
+    // Transpose GLU output to [batch, d_model, time] for causal_conv1d
+    nemo::TensorF orig_glu_transposed({batch, d_model, seq_len});
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                orig_glu_transposed(b, d, t) = orig_after_glu(b, t, d);
+            }
+        }
+    }
+    nemo::TensorF orig_after_dw;
+    nemo::causal_conv1d(orig_glu_transposed,
+                        ref_weights.require("encoder.layers.0.conv.depthwise_conv.weight").data.data(),
+                        d_model, d_model, 9, 1, d_model, nullptr, orig_after_dw);
+    printf("Original after dw shape: [%zu, %zu, %zu]\n",
+           orig_after_dw.shape[0], orig_after_dw.shape[1], orig_after_dw.shape[2]);
+    printf("Original after dw[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           orig_after_dw(0,0,0), orig_after_dw(0,0,1), orig_after_dw(0,0,2),
+           orig_after_dw(0,0,3), orig_after_dw(0,0,4));
+
+    // Get GGML after dw output: [d_model, seq_len, batch]
+    std::vector<float> ggml_dw(d_model * seq_len * batch);
+    ggml_backend_tensor_get(after_dw, ggml_dw.data(), 0, ggml_dw.size() * sizeof(float));
+    printf("GGML after dw shape: [%lld, %lld, %lld]\n",
+           (long long)after_dw->ne[0], (long long)after_dw->ne[1], (long long)after_dw->ne[2]);
+    printf("GGML after dw[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_dw[0], ggml_dw[1], ggml_dw[2], ggml_dw[3], ggml_dw[4]);
+
+    // Compare dw outputs
+    // orig_after_dw: [batch, d_model, time]
+    // ggml_dw: [d_model, seq_len, batch]
+    float dw_max_diff = 0.0f;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < seq_len; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                float ref_val = orig_after_dw(b, d, t);
+                // GGML dw: [d_model, seq_len, batch] -> index = d + t*d_model + b*d_model*seq_len
+                float ggml_val = ggml_dw[d + t * d_model + b * d_model * seq_len];
+                float diff = std::abs(ref_val - ggml_val);
+                dw_max_diff = std::max(dw_max_diff, diff);
+            }
+        }
+    }
+    printf("Depthwise conv max diff: %.6e\n", dw_max_diff);
+
+    // Get full conv module output
+    // out: [seq_len, d_model, batch] after final permute
+    std::vector<float> ggml_out(seq_len * d_model * batch);
+    ggml_backend_tensor_get(out, ggml_out.data(), 0, ggml_out.size() * sizeof(float));
+
+    printf("GGML conv module output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_out[0], ggml_out[1], ggml_out[2], ggml_out[3], ggml_out[4]);
+
+    // Compare with original output (ref_output is already computed above)
+    // ref_output: [batch, time, d_model]
+    // ggml_out: [seq_len, d_model, batch] -> index = t + d*seq_len + b*seq_len*d_model
     float max_diff = 0.0f;
     for (size_t b = 0; b < batch; b++) {
         for (size_t t = 0; t < seq_len; t++) {
-            for (size_t d = 0; d < half_ch; d++) {
-                // ref_glu: [batch, time, 1024]
-                // ggml: [1024, time, batch]
-                float ref_val = ref_glu(b, t, d);
-                float ggml_val = ggml_glu_out[(b * seq_len + t) * half_ch + d];
+            for (size_t d = 0; d < d_model; d++) {
+                // ref_output: [batch, time, d_model]
+                float ref_val = ref_output(b, t, d);
+                // ggml_out: [seq_len, d_model, batch] -> index = t + d*seq_len + b*seq_len*d_model
+                float ggml_val = ggml_out[t + d * seq_len + b * seq_len * d_model];
                 float diff = std::abs(ref_val - ggml_val);
                 max_diff = std::max(max_diff, diff);
             }
         }
     }
 
-    printf("GLU max diff: %.6e\n", max_diff);
+    printf("Conv module max diff: %.6e\n", max_diff);
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-4f;
-    printf("Conformer Conv (GLU) test: %s\n\n", passed ? "PASS" : "FAIL");
+    bool passed = max_diff < 1e-2f;  // Allow larger diff for multi-step computation
+    printf("Conformer Conv module test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
 

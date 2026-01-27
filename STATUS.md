@@ -1,6 +1,6 @@
 # Implementation Status
 
-**Last Updated**: 2026-01-26
+**Last Updated**: 2026-01-27
 
 ## Current State: GGML Port In Progress
 
@@ -58,20 +58,23 @@ Key implementation notes:
 - rel_shift formula verified: out[i,j] = input[i, j + qlen - 1 - i]
 - Full MHA requires implementing rel_shift in ggml (pad-reshape-slice operation)
 
-#### Phase 6: Conformer Conv Module (IN PROGRESS)
+#### Phase 6: Conformer Conv Module (COMPLETE)
 | Test | Status | Max Diff |
 |------|--------|----------|
 | Pointwise Conv1 + GLU | PASS | 1.8e-05 |
-| Depthwise Causal Conv1d | TODO | - |
-| Full Conv Module | TODO | - |
+| Depthwise Causal Conv1d | PASS | 5.7e-05 |
+| Full Conv Module | PASS | 8.9e-04 |
 
 Key implementation notes:
 - Pointwise conv1 implemented as reshape + mul_mat
 - GLU implemented as view + sigmoid + mul
-- Depthwise causal conv1d requires special handling
+- Depthwise causal conv1d implemented manually:
+  - `ggml_pad_ext` for left-only causal padding
+  - Loop over kernel positions, multiply shifted slices by kernel weights
+  - Transpose kernel to [channels, kernel_size] for efficient column access
+- LayerNorm + Swish + Pointwise conv2 follow same patterns
 
 #### Remaining Phases:
-- Phase 6 (cont): Depthwise causal conv1d, full conv module
 - Phase 7: Full Conformer layer integration
 - Phase 8-12: Full encoder, decoder, joint, greedy decode
 
