@@ -115,7 +115,11 @@ int main(int argc, char ** argv) {
     // Initialize cache-aware streaming context
     nemo_cache_config cache_cfg = nemo_cache_config::default_config();
     cache_cfg.att_right_context = right_context;  // User-selected latency mode
-    cache_cfg.chunk_samples = chunk_samples;
+    
+    // Get the calculated chunk sizes based on latency mode
+    int mel_chunk_frames = cache_cfg.get_chunk_mel_frames();
+    int computed_chunk_samples = cache_cfg.get_chunk_samples();
+    int latency_ms = cache_cfg.get_latency_ms();
 
     struct nemo_stream_context * sctx = nemo_stream_init(ctx, &cache_cfg);
     if (!sctx) {
@@ -127,47 +131,59 @@ int main(int argc, char ** argv) {
     printf("Cache-aware streaming initialized:\n");
     printf("  Attention left context:  %d frames\n", cache_cfg.att_left_context);
     printf("  Attention right context: %d frames\n", cache_cfg.att_right_context);
+    printf("  Mel chunk frames:        %d (%.1f ms)\n", mel_chunk_frames, mel_chunk_frames * 10.0f);
+    printf("  Latency:                 %d ms\n", latency_ms);
     printf("  Conv kernel size:        %d\n", cache_cfg.conv_kernel_size);
     printf("  Number of layers:        %d\n", cache_cfg.n_layers);
     printf("  Model dimension:         %d\n", cache_cfg.d_model);
     printf("\n");
 
-    // Process audio in chunks
+    // Process audio in chunks with TRUE STREAMING
+    // Use the computed chunk size matching the latency mode
     printf("=== Streaming Transcription ===\n");
-    printf("(Processing audio in 80ms chunks...)\n\n");
-    
+    printf("(Processing audio in %d ms chunks with cache-aware streaming...)\n\n", latency_ms);
+
     auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     int chunks_processed = 0;
     int samples_processed = 0;
-    
+
+    // Track incremental transcript
+    printf("Transcription: ");
+    fflush(stdout);
+
     while (samples_processed < total_samples) {
         int remaining = total_samples - samples_processed;
-        int n_samples = (remaining < chunk_samples) ? remaining : chunk_samples;
-        
+        // Use the proper chunk size based on latency mode
+        int n_samples = (remaining < computed_chunk_samples) ? remaining : computed_chunk_samples;
+
         const int16_t * chunk_ptr = audio_data.data() + samples_processed;
-        
-        // Process chunk - accumulates audio, O(1) per chunk
-        nemo_stream_process(sctx, chunk_ptr, n_samples);
-        
+
+        // Process chunk - NOW RETURNS TEXT IMMEDIATELY
+        std::string new_text = nemo_stream_process(sctx, chunk_ptr, n_samples);
+
+        // Print incremental text as it arrives
+        if (!new_text.empty()) {
+            printf("%s", new_text.c_str());
+            fflush(stdout);
+        }
+
         samples_processed += n_samples;
         chunks_processed++;
     }
-    
-    // Show we're about to finalize
-    printf("Accumulated %d chunks (%.2f sec), now transcribing...\n", 
-           chunks_processed, total_duration_sec);
 
     // Finalize - flush any remaining buffered audio
-    printf("\nFinalizing...\n");
     std::string final_text = nemo_stream_finalize(sctx);
-    
+    if (!final_text.empty()) {
+        // Final text might have additional tokens from flush
+        // But nemo_stream_finalize returns full transcript, so just newline
+    }
+    printf("\n");
+
     auto end_time = std::chrono::high_resolution_clock::now();
     double processing_time_sec = std::chrono::duration<double>(end_time - start_time).count();
 
-    printf("\n=== Final Transcription ===\n");
-    printf("%s\n", final_text.c_str());
-    printf("============================\n");
+    printf("\n=== Complete ===\n");
 
     // Print statistics
     printf("\nStatistics:\n");

@@ -88,22 +88,29 @@ void nemo_layer_conv_cache::update(const float* new_data, int32_t seq_len) {
 
 void nemo_encoder_cache::init(const nemo_cache_config& cfg) {
     config = cfg;
-    
+
     // Initialize per-layer caches
     attn_caches.resize(cfg.n_layers);
     conv_caches.resize(cfg.n_layers);
-    
+
     for (int i = 0; i < cfg.n_layers; i++) {
         attn_caches[i].init(cfg.att_left_context, cfg.d_model);
         conv_caches[i].init(cfg.conv_kernel_size, cfg.d_model);
     }
-    
+
     // Initialize mel buffer
     mel_buffer.clear();
     mel_buffer_len = 0;
-    
+
     // Initialize audio buffer
     audio_buffer.clear();
+
+    // Initialize streaming audio history
+    // Need n_fft/2 = 256 samples of history for STFT
+    audio_history.clear();
+    audio_history_len = 0;
+    last_sample = 0.0f;
+    total_encoder_frames = 0;
 }
 
 void nemo_encoder_cache::reset() {
@@ -112,6 +119,10 @@ void nemo_encoder_cache::reset() {
     mel_buffer.clear();
     mel_buffer_len = 0;
     audio_buffer.clear();
+    audio_history.clear();
+    audio_history_len = 0;
+    last_sample = 0.0f;
+    total_encoder_frames = 0;
 }
 
 size_t nemo_encoder_cache::memory_usage_bytes() const {
@@ -124,8 +135,8 @@ size_t nemo_encoder_cache::memory_usage_bytes() const {
     total += config.n_layers * config.d_model * (config.conv_kernel_size - 1) * sizeof(float);
     
     // Buffers (approximate max)
-    total += config.n_mels * config.subsampling_factor * sizeof(float);  // mel buffer
-    total += config.chunk_samples * sizeof(int16_t);  // audio buffer
+    total += config.n_mels * config.get_chunk_mel_frames() * sizeof(float);  // mel buffer
+    total += config.get_chunk_samples() * sizeof(int16_t);  // audio buffer
     
     return total;
 }
@@ -155,20 +166,51 @@ void nemo_encoder_graph::reset() {
 void nemo_stream_context::init(struct nemo_context* ctx, const nemo_cache_config& cfg) {
     nctx = ctx;
     config = cfg;
-    
+
     // Initialize encoder cache
     encoder_cache.init(cfg);
-    
+
     // Initialize decoder state
     decoder_state.init(cfg.decoder_layers, cfg.decoder_hidden);
     decoder_state.prev_token = cfg.blank_token;
-    
-    // Pre-build encoder graph for streaming (8 mel frames -> 1+ encoder frames)
-    encoder_graph.init(ctx, cfg, cfg.subsampling_factor);
-    
-    // Clear tokens
+
+    // Pre-build encoder graph for streaming
+    // Chunk size depends on att_right_context (latency mode):
+    //   [70, 0]  -> 8 mel frames  -> 80ms  latency (pure causal)
+    //   [70, 1]  -> 16 mel frames -> 160ms latency
+    //   [70, 6]  -> 56 mel frames -> 560ms latency
+    //   [70, 13] -> 112 mel frames -> 1.12s latency
+    const int mel_chunk_frames = cfg.get_chunk_mel_frames();
+    encoder_graph.init(ctx, cfg, mel_chunk_frames);
+
+    // Initialize decode graph as nullptr (built on first use)
+    decode_ctx = nullptr;
+    decode_graph = nullptr;
+    decode_allocr = nullptr;
+    decode_graph_initialized = false;
+
+    // Copy preprocessor weights to CPU for streaming mel conversion
+    // filterbank: [n_mels, n_bins] = [128, 257]
+    // window: [n_window_size] = [400]
+    const size_t n_mels = 128;
+    const size_t n_bins = 257;  // n_fft/2 + 1 = 512/2 + 1
+    const size_t n_window_size = 400;
+
+    filterbank_cpu.resize(n_mels * n_bins);
+    window_cpu.resize(n_window_size);
+
+    // Copy from GPU/backend tensors to CPU
+    ggml_backend_tensor_get(ctx->model.preprocessor_weights.filterbank,
+                            filterbank_cpu.data(), 0,
+                            filterbank_cpu.size() * sizeof(float));
+    ggml_backend_tensor_get(ctx->model.preprocessor_weights.window,
+                            window_cpu.data(), 0,
+                            window_cpu.size() * sizeof(float));
+
+    // Clear tokens and transcript
     tokens.clear();
-    
+    transcript.clear();
+
     // Reset timing
     total_audio_seconds = 0;
     total_compute_seconds = 0;
@@ -180,8 +222,10 @@ void nemo_stream_context::reset() {
     decoder_state.reset();
     decoder_state.prev_token = config.blank_token;
     tokens.clear();
+    transcript.clear();
     total_audio_seconds = 0;
     total_compute_seconds = 0;
+    // Don't reset decode_graph - it can be reused
 }
 
 // Forward declarations for graph building
@@ -705,7 +749,436 @@ struct nemo_stream_context* nemo_stream_init(
     return sctx;
 }
 
-std::string nemo_stream_process(
+// Forward declaration for token to text conversion (from nemo-ggml.cpp)
+std::string tokens_to_text(const std::vector<timed_token>& tokens, const std::vector<char8>& vocab, bool timestamp_words);
+
+// Helper to convert plain token IDs to text (no timestamps)
+static std::string tokens_to_text_simple(const std::vector<int>& token_ids, const std::vector<char8>& vocab) {
+    std::vector<timed_token> tokens;
+    tokens.reserve(token_ids.size());
+    for (int id : token_ids) {
+        tokens.push_back({id, 0});
+    }
+    return tokens_to_text(tokens, vocab, false);
+}
+
+// Helper: Convert audio chunk to mel spectrogram for streaming
+// Handles pre-emphasis continuity and STFT windowing overlap
+static size_t stream_audio_to_mel(
+    nemo_stream_context* sctx,
+    const int16_t* audio,
+    int n_samples,
+    std::vector<float>& mel_out
+) {
+    nemo_preprocessor* pp = sctx->nctx->preprocessor;
+    if (!pp) return 0;
+
+    // Parameters from preprocessor
+    const size_t n_fft = 512;
+    const size_t hop_length = 160;  // 10ms at 16kHz
+    const size_t win_length = 400;  // 25ms
+    const size_t n_mels = 128;
+    const size_t n_bins = 1 + n_fft / 2;  // 257
+    const float preemph = 0.97f;
+    const float log_zero_guard = 5.960464477539063e-8f;  // 2^-24
+
+    // Minimum samples needed to produce at least one mel frame
+    // For first frame, we need n_fft samples (with zero padding conceptually)
+    // But for streaming, we accumulate until we have enough for subsampling
+
+    auto& cache = sctx->encoder_cache;
+
+    // Convert new audio to float with pre-emphasis, maintaining continuity
+    std::vector<float> audio_float(n_samples);
+    const float scale = 1.0f / 32768.0f;
+    for (int i = 0; i < n_samples; i++) {
+        float curr = audio[i] * scale;
+        float prev = (i == 0) ? cache.last_sample : (audio[i-1] * scale);
+        audio_float[i] = curr - preemph * prev;
+    }
+    if (n_samples > 0) {
+        cache.last_sample = audio[n_samples - 1] * scale;
+    }
+
+    // Append to audio history buffer
+    cache.audio_history.insert(cache.audio_history.end(), audio_float.begin(), audio_float.end());
+    cache.audio_history_len = cache.audio_history.size();
+
+    // Calculate how many mel frames we can produce
+    // We need at least n_fft samples to produce any frame
+    if ((size_t)cache.audio_history_len < n_fft) {
+        mel_out.clear();
+        return 0;
+    }
+
+    // Number of frames = 1 + (audio_len - n_fft) / hop_length
+    // But we want to keep n_fft/2 samples as overlap for next chunk
+    size_t usable_len = cache.audio_history_len - n_fft / 2;
+    size_t n_frames = (usable_len >= n_fft) ? 1 + (usable_len - n_fft) / hop_length : 0;
+
+    if (n_frames == 0) {
+        mel_out.clear();
+        return 0;
+    }
+
+    mel_out.resize(n_frames * n_mels);
+
+    // Precompute sin/cos tables (could cache this)
+    std::vector<float> sin_vals(n_fft), cos_vals(n_fft);
+    for (size_t i = 0; i < n_fft; i++) {
+        float theta = (2.0f * M_PI * i) / n_fft;
+        sin_vals[i] = sinf(theta);
+        cos_vals[i] = cosf(theta);
+    }
+
+    // Get filterbank and window from CPU cache (copied at init time)
+    const float* fb_data = sctx->filterbank_cpu.data();
+    const float* win_data = sctx->window_cpu.data();
+
+    std::vector<float> frame(n_fft);
+    std::vector<float> real_out(n_bins), imag_out(n_bins);
+
+    for (size_t t = 0; t < n_frames; t++) {
+        size_t start = t * hop_length;
+
+        // Extract and window the frame
+        size_t win_offset = (n_fft - win_length) / 2;
+        for (size_t i = 0; i < n_fft; i++) {
+            float sample = 0.0f;
+            if (start + i < (size_t)cache.audio_history_len) {
+                sample = cache.audio_history[start + i];
+            }
+            // Apply window
+            if (i >= win_offset && i < win_offset + win_length) {
+                sample *= win_data[i - win_offset];
+            } else {
+                sample = 0.0f;
+            }
+            frame[i] = sample;
+        }
+
+        // Compute DFT
+        for (size_t k = 0; k < n_bins; k++) {
+            float real_sum = 0.0f, imag_sum = 0.0f;
+            for (size_t n = 0; n < n_fft; n++) {
+                size_t idx = (k * n) % n_fft;
+                real_sum += frame[n] * cos_vals[idx];
+                imag_sum -= frame[n] * sin_vals[idx];
+            }
+            real_out[k] = real_sum;
+            imag_out[k] = imag_sum;
+        }
+
+        // Power spectrum + mel filterbank + log
+        for (size_t m = 0; m < n_mels; m++) {
+            float sum = 0.0f;
+            for (size_t k = 0; k < n_bins; k++) {
+                float power = real_out[k] * real_out[k] + imag_out[k] * imag_out[k];
+                sum += fb_data[m * n_bins + k] * power;
+            }
+            mel_out[t * n_mels + m] = logf(sum + log_zero_guard);
+        }
+    }
+
+    // Remove consumed audio from history, keeping overlap for next chunk
+    size_t consumed = n_frames * hop_length;
+    size_t keep = cache.audio_history_len - consumed;
+    if (keep > 0) {
+        memmove(cache.audio_history.data(), cache.audio_history.data() + consumed, keep * sizeof(float));
+    }
+    cache.audio_history.resize(keep);
+    cache.audio_history_len = keep;
+
+    return n_frames;
+}
+
+// Helper: Run one step of greedy decode
+static int decode_one_step(
+    nemo_stream_context* sctx,
+    const float* enc_frame  // [d_model]
+) {
+    nemo_context* nctx = sctx->nctx;
+    const int d_model = sctx->config.d_model;
+    const int hidden_size = sctx->config.decoder_hidden;
+    const int num_layers = sctx->config.decoder_layers;
+    const int vocab_size = sctx->config.vocab_size;
+    const int blank_token = sctx->config.blank_token;
+    const int MAX_SYMBOLS_PER_STEP = 10;
+
+    int emitted_token = -1;  // -1 = no token emitted
+
+    for (int sym = 0; sym < MAX_SYMBOLS_PER_STEP; sym++) {
+        // Create compute context for this step
+        size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+        std::vector<uint8_t> compute_buf(buf_size);
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ buf_size,
+            /*.mem_buffer =*/ compute_buf.data(),
+            /*.no_alloc   =*/ true,
+        };
+
+        struct ggml_context* ctx0 = ggml_init(params);
+        if (!ctx0) break;
+
+        // Create input tensors
+        struct ggml_tensor* h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+        struct ggml_tensor* c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+        struct ggml_tensor* token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+        struct ggml_tensor* enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_model);
+        ggml_set_input(h_in);
+        ggml_set_input(c_in);
+        ggml_set_input(token_emb);
+        ggml_set_input(enc_in);
+
+        // Build decoder step
+        struct ggml_tensor* h_out = nullptr;
+        struct ggml_tensor* c_out = nullptr;
+        struct ggml_tensor* dec_out = build_decoder_step(ctx0, token_emb, h_in, c_in,
+                                                          &nctx->model.decoder, &h_out, &c_out);
+
+        // Build joint
+        struct ggml_tensor* logits = build_joint(ctx0, enc_in, dec_out, &nctx->model.joint);
+        ggml_set_output(logits);
+        ggml_set_output(h_out);
+        ggml_set_output(c_out);
+
+        // Build graph
+        struct ggml_cgraph* gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, logits);
+        ggml_build_forward_expand(gf, h_out);
+        ggml_build_forward_expand(gf, c_out);
+
+        // Allocate
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(nctx->model.backend));
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+            break;
+        }
+
+        // Set inputs
+        ggml_backend_tensor_set(h_in, sctx->decoder_state.h.data(), 0,
+                                 sctx->decoder_state.h.size() * sizeof(float));
+        ggml_backend_tensor_set(c_in, sctx->decoder_state.c.data(), 0,
+                                 sctx->decoder_state.c.size() * sizeof(float));
+
+        // Get embedding for prev_token
+        std::vector<float> emb_data(hidden_size);
+        size_t emb_offset = sctx->decoder_state.prev_token * hidden_size * sizeof(float);
+        ggml_backend_tensor_get(nctx->model.decoder.embedding, emb_data.data(), emb_offset,
+                                 hidden_size * sizeof(float));
+        ggml_backend_tensor_set(token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
+
+        ggml_backend_tensor_set(enc_in, enc_frame, 0, d_model * sizeof(float));
+
+        // Compute
+        ggml_backend_graph_compute(nctx->model.backend, gf);
+
+        // Get logits and find argmax
+        std::vector<float> logits_data(vocab_size);
+        ggml_backend_tensor_get(logits, logits_data.data(), 0, vocab_size * sizeof(float));
+
+        int best_token = 0;
+        float best_score = logits_data[0];
+        for (int v = 1; v < vocab_size; v++) {
+            if (logits_data[v] > best_score) {
+                best_score = logits_data[v];
+                best_token = v;
+            }
+        }
+
+        // Get updated state
+        std::vector<float> new_h_state(sctx->decoder_state.h.size());
+        std::vector<float> new_c_state(sctx->decoder_state.c.size());
+        ggml_backend_tensor_get(h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
+        ggml_backend_tensor_get(c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
+
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+
+        if (best_token == blank_token) {
+            // Move to next time step - DON'T update state
+            break;
+        }
+
+        // Emit non-blank token
+        emitted_token = best_token;
+        sctx->decoder_state.prev_token = best_token;
+
+        // Only update LSTM state when emitting a non-blank token
+        sctx->decoder_state.h = std::move(new_h_state);
+        sctx->decoder_state.c = std::move(new_c_state);
+    }
+
+    return emitted_token;
+}
+
+// Helper: Process encoder output through cached conformer and decode
+static std::string process_mel_chunk_streaming(
+    nemo_stream_context* sctx,
+    const float* mel_data,  // [n_mels, n_frames] column-major
+    int n_mel_frames
+) {
+    if (n_mel_frames < 8) {
+        // Buffer mel frames until we have enough for subsampling
+        size_t n_mels = sctx->config.n_mels;
+        sctx->encoder_cache.mel_buffer.insert(
+            sctx->encoder_cache.mel_buffer.end(),
+            mel_data, mel_data + n_mel_frames * n_mels
+        );
+        sctx->encoder_cache.mel_buffer_len += n_mel_frames;
+        return "";
+    }
+
+    nemo_context* nctx = sctx->nctx;
+    const int d_model = sctx->config.d_model;
+    const int n_mels = sctx->config.n_mels;
+    const int n_layers = sctx->config.n_layers;
+    const int cache_len = sctx->config.att_left_context;
+    const int conv_cache_len = sctx->config.conv_kernel_size - 1;
+
+    // Check if encoder graph is ready
+    if (!sctx->encoder_graph.initialized) {
+        fprintf(stderr, "[WARN] Encoder graph not initialized\n");
+        return "";
+    }
+
+    // Set mel input data (need to transpose from row-major to column-major)
+    // mel_data is [n_frames, n_mels] row-major, need [n_mels, n_frames]
+    std::vector<float> mel_transposed(n_mel_frames * n_mels);
+    for (int t = 0; t < n_mel_frames; t++) {
+        for (int m = 0; m < n_mels; m++) {
+            mel_transposed[m * n_mel_frames + t] = mel_data[t * n_mels + m];
+        }
+    }
+
+    // Debug: check mel input values
+    static bool first_mel = true;
+    if (first_mel) {
+        float sum = 0, min_val = 1e30, max_val = -1e30;
+        for (int i = 0; i < n_mel_frames * n_mels; i++) {
+            sum += mel_data[i];
+            if (mel_data[i] < min_val) min_val = mel_data[i];
+            if (mel_data[i] > max_val) max_val = mel_data[i];
+        }
+        fprintf(stderr, "[DEBUG] Mel input: frames=%d, mean=%.2f, min=%.2f, max=%.2f\n",
+                n_mel_frames, sum / (n_mel_frames * n_mels), min_val, max_val);
+        first_mel = false;
+    }
+
+    ggml_backend_tensor_set(sctx->encoder_graph.mel_input, mel_transposed.data(), 0,
+                             mel_transposed.size() * sizeof(float));
+
+    // Set cache inputs from stored caches
+    for (int l = 0; l < n_layers; l++) {
+        auto& attn_cache = sctx->encoder_cache.attn_caches[l];
+        auto& conv_cache = sctx->encoder_cache.conv_caches[l];
+
+        ggml_backend_tensor_set(sctx->encoder_graph.k_cache_ins[l],
+                                 attn_cache.k_cache.data(), 0,
+                                 cache_len * d_model * sizeof(float));
+        ggml_backend_tensor_set(sctx->encoder_graph.v_cache_ins[l],
+                                 attn_cache.v_cache.data(), 0,
+                                 cache_len * d_model * sizeof(float));
+        ggml_backend_tensor_set(sctx->encoder_graph.conv_cache_ins[l],
+                                 conv_cache.cache.data(), 0,
+                                 conv_cache_len * d_model * sizeof(float));
+    }
+
+    // Run encoder graph
+    ggml_backend_graph_compute(nctx->model.backend, sctx->encoder_graph.graph);
+
+    // Get encoder output
+    int64_t enc_out_frames = sctx->encoder_graph.encoder_out->ne[1];
+    std::vector<float> enc_out(d_model * enc_out_frames);
+    ggml_backend_tensor_get(sctx->encoder_graph.encoder_out, enc_out.data(), 0,
+                             enc_out.size() * sizeof(float));
+
+    // Debug: check encoder output magnitude
+    static bool first_enc = true;
+    if (first_enc) {
+        float sum = 0, max_val = 0;
+        for (size_t i = 0; i < enc_out.size(); i++) {
+            sum += enc_out[i] * enc_out[i];
+            if (fabsf(enc_out[i]) > max_val) max_val = fabsf(enc_out[i]);
+        }
+        fprintf(stderr, "[DEBUG] Encoder output: frames=%lld, rms=%.4f, max=%.4f\n",
+                (long long)enc_out_frames, sqrtf(sum / enc_out.size()), max_val);
+        first_enc = false;
+    }
+
+    // Update caches from graph outputs
+    for (int l = 0; l < n_layers; l++) {
+        if (sctx->encoder_graph.k_cache_outs[l]) {
+            std::vector<float> k_out(cache_len * d_model);
+            std::vector<float> v_out(cache_len * d_model);
+            ggml_backend_tensor_get(sctx->encoder_graph.k_cache_outs[l], k_out.data(), 0,
+                                     k_out.size() * sizeof(float));
+            ggml_backend_tensor_get(sctx->encoder_graph.v_cache_outs[l], v_out.data(), 0,
+                                     v_out.size() * sizeof(float));
+            // Direct copy since graph outputs the right size
+            memcpy(sctx->encoder_cache.attn_caches[l].k_cache.data(), k_out.data(),
+                   k_out.size() * sizeof(float));
+            memcpy(sctx->encoder_cache.attn_caches[l].v_cache.data(), v_out.data(),
+                   v_out.size() * sizeof(float));
+            sctx->encoder_cache.attn_caches[l].cache_len = cache_len;
+        }
+        if (sctx->encoder_graph.conv_cache_outs[l]) {
+            std::vector<float> conv_out(conv_cache_len * d_model);
+            ggml_backend_tensor_get(sctx->encoder_graph.conv_cache_outs[l], conv_out.data(), 0,
+                                     conv_out.size() * sizeof(float));
+            memcpy(sctx->encoder_cache.conv_caches[l].cache.data(), conv_out.data(),
+                   conv_out.size() * sizeof(float));
+        }
+    }
+
+    // Run greedy decode on each encoder frame
+    std::vector<int> new_tokens;
+    static bool debug_decode = true;
+    for (int64_t t = 0; t < enc_out_frames; t++) {
+        const float* enc_frame = enc_out.data() + t * d_model;
+        int token = decode_one_step(sctx, enc_frame);
+        if (debug_decode && sctx->encoder_cache.total_encoder_frames < 10) {
+            fprintf(stderr, "[DEBUG] Frame %lld: token=%d\n",
+                    (long long)(sctx->encoder_cache.total_encoder_frames + t), token);
+        }
+        if (token >= 0 && token != sctx->config.blank_token) {
+            new_tokens.push_back(token);
+            sctx->tokens.push_back(token);
+        }
+    }
+
+    sctx->encoder_cache.total_encoder_frames += enc_out_frames;
+
+    // Convert new tokens to text
+    if (new_tokens.empty()) {
+        return "";
+    }
+
+    std::string new_text = tokens_to_text_simple(new_tokens, nctx->model.vocab);
+    sctx->transcript += new_text;
+    return new_text;
+}
+
+// Forward declaration
+std::string nemo_transcribe_audio_with_state(
+    struct nemo_context* ctx,
+    const int16_t* audio_data,
+    int n_samples,
+    nemo_decoder_state* decoder_state
+);
+
+// Forward declaration
+std::string nemo_transcribe_audio(
+    struct nemo_context* ctx,
+    const int16_t* audio_data,
+    int n_samples
+);
+
+// True incremental streaming using cached encoder
+// This processes audio incrementally without re-transcribing
+std::string nemo_stream_process_incremental(
     struct nemo_stream_context* sctx,
     const int16_t* audio,
     int n_samples
@@ -714,132 +1187,163 @@ std::string nemo_stream_process(
     
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // Add to audio buffer
-    sctx->encoder_cache.audio_buffer.insert(
-        sctx->encoder_cache.audio_buffer.end(),
-        audio, audio + n_samples
-    );
-    
     sctx->total_audio_seconds += (double)n_samples / sctx->config.sample_rate;
     
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-    sctx->total_compute_seconds += elapsed.count();
-    
-    // For now, just accumulate audio - O(1) per chunk
-    // Processing happens at finalize or get_transcript - O(N) total
-    return "";
-}
-
-// Process audio in chunks using the batch encoder
-// This approach processes audio in fixed-size chunks (e.g., 10 seconds each)
-// to support unlimited audio length while maintaining correct transcription.
-// Decoder state (prev_token, LSTM hidden/cell states) is preserved between chunks
-// for better continuity across chunk boundaries.
-static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
-    struct nemo_context* nctx = sctx->nctx;
-    // nctx->timestamp_words = true;
-    const int sample_rate = sctx->config.sample_rate;
-    
-    // Chunk size in samples (10 seconds per chunk = 160000 samples at 16kHz)
-    // This produces ~125 encoder frames per chunk, well within position embedding limits
-    const size_t chunk_samples = 10 * sample_rate;
-    
-    const size_t total_samples = sctx->encoder_cache.audio_buffer.size();
-    const int16_t* audio_data = sctx->encoder_cache.audio_buffer.data();
-    
-    std::string full_transcript;
-    size_t processed_samples = 0;
-    int chunk_num = 0;
-    
-    // Decoder state preserved across chunks for better continuity
-    // The prev_token and LSTM states carry over from one chunk to the next
-    nemo_decoder_state decoder_state;
-    // Initialize with proper dimensions (2 LSTM layers, 640 hidden size)
-    // The blank token (1024) is used as initial prev_token
-    decoder_state.init(2, 640);
-    decoder_state.prev_token = sctx->config.blank_token;  // 1024
-    
-    while (processed_samples < total_samples) {
-        // Calculate chunk size for this iteration
-        size_t remaining = total_samples - processed_samples;
-        size_t this_chunk = std::min(remaining, chunk_samples);
-        
-        chunk_num++;
-        // fprintf(stderr, "[STREAM] Processing chunk %d: samples %zu-%zu of %zu (%.1f-%.1f sec)\n",
-        //         chunk_num, processed_samples, processed_samples + this_chunk - 1, total_samples,
-        //         (double)processed_samples / sample_rate,
-        //         (double)(processed_samples + this_chunk) / sample_rate);
-
-        // Use transcription with state preservation for decoder continuity
-        std::string chunk_text = nemo_transcribe_audio_with_state(
-            nctx,
-            audio_data + processed_samples,
-            this_chunk,
-            &decoder_state
-        );
-        
-        // Append to full transcript
-        if (!chunk_text.empty()) {
-            if (!full_transcript.empty()) {
-                full_transcript += " ";
-            }
-            full_transcript += chunk_text;
-        }
-        printf("%s\n", chunk_text.c_str());
-        processed_samples += this_chunk;
-    }
-    
-    fprintf(stderr, "[STREAM] Processed %d chunks, total tokens in transcript\n", chunk_num);
-    
-    return full_transcript;
-}
-
-std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
-    if (!sctx) return "";
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
+    // Convert audio to mel spectrogram
+    std::vector<float> mel;
+    size_t n_mel_frames = stream_audio_to_mel(sctx, audio, n_samples, mel);
     
     std::string result;
     
-    if (!sctx->encoder_cache.audio_buffer.empty()) {
-        size_t n_samples = sctx->encoder_cache.audio_buffer.size();
-        double audio_seconds = (double)n_samples / sctx->config.sample_rate;
+    // Process when we have enough mel frames for the configured chunk size
+    // Add to mel buffer if not enough
+    if (n_mel_frames > 0) {
+        sctx->encoder_cache.mel_buffer.insert(
+            sctx->encoder_cache.mel_buffer.end(),
+            mel.begin(), mel.end()
+        );
+        sctx->encoder_cache.mel_buffer_len += n_mel_frames;
+    }
+    
+    // The pre-built graph expects the chunk size based on latency mode:
+    //   [70, 0]  -> 8 mel frames  -> 80ms  latency (pure causal)
+    //   [70, 13] -> 112 mel frames -> 1.12s latency (default)
+    const int graph_mel_frames = sctx->config.get_chunk_mel_frames();
+    
+    while ((int)sctx->encoder_cache.mel_buffer_len >= graph_mel_frames) {
+        // Process exactly the chunk size the graph expects
+        std::string chunk_text = process_mel_chunk_streaming(
+            sctx,
+            sctx->encoder_cache.mel_buffer.data(),
+            graph_mel_frames
+        );
         
-        fprintf(stderr, "[STREAM] Finalizing: %zu samples (%.2f seconds)\n",
-                n_samples, audio_seconds);
+        if (!chunk_text.empty()) {
+            result += chunk_text;
+        }
         
-        // Use chunked processing - each chunk uses the batch encoder
-        // This gives correct transcription while supporting unlimited audio length
-        result = process_audio_chunked(sctx);
-        sctx->encoder_cache.audio_buffer.clear();
+        // Remove processed frames from buffer
+        size_t n_mels = sctx->config.n_mels;
+        size_t remaining = sctx->encoder_cache.mel_buffer_len - graph_mel_frames;
+        
+        if (remaining > 0) {
+            memmove(sctx->encoder_cache.mel_buffer.data(),
+                    sctx->encoder_cache.mel_buffer.data() + graph_mel_frames * n_mels,
+                    remaining * n_mels * sizeof(float));
+        }
+        sctx->encoder_cache.mel_buffer.resize(remaining * n_mels);
+        sctx->encoder_cache.mel_buffer_len = remaining;
     }
     
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
     sctx->total_compute_seconds += elapsed.count();
-    
-    fprintf(stderr, "[STREAM] Compute time: %.2f seconds (RTF: %.3fx)\n",
-            elapsed.count(), 
-            elapsed.count() / ((double)sctx->encoder_cache.audio_buffer.size() / sctx->config.sample_rate + 0.001));
     
     return result;
 }
 
+// Default streaming: uses batch re-transcription for higher quality
+std::string nemo_stream_process(
+    struct nemo_stream_context* sctx,
+    const int16_t* audio,
+    int n_samples
+) {
+    if (!sctx || !audio || n_samples <= 0) return "";
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Accumulate audio
+    sctx->encoder_cache.audio_buffer.insert(
+        sctx->encoder_cache.audio_buffer.end(),
+        audio, audio + n_samples
+    );
+
+    sctx->total_audio_seconds += (double)n_samples / sctx->config.sample_rate;
+
+    // Streaming latency: emit text every N seconds of new audio
+    const int emit_interval_ms = 2000;  // Emit every 2 seconds
+    const int emit_interval_samples = emit_interval_ms * sctx->config.sample_rate / 1000;
+
+    std::string result;
+
+    int buffered = sctx->encoder_cache.audio_buffer.size();
+    int last_emitted = sctx->decoder_state.frame_offset * 8 * 160;  // Approx samples already processed
+
+    // Process when we have enough NEW audio since last emission
+    if (buffered - last_emitted >= emit_interval_samples) {
+        // Re-transcribe ALL audio from beginning for consistency
+        // This is O(N^2) but ensures correct output
+        std::string full_transcript = nemo_transcribe_audio(
+            sctx->nctx,
+            sctx->encoder_cache.audio_buffer.data(),
+            buffered
+        );
+
+        // Emit only the new portion (what we haven't emitted before)
+        if (full_transcript.length() > sctx->transcript.length()) {
+            result = full_transcript.substr(sctx->transcript.length());
+            // Trim leading space if transcript ended with space
+            if (!result.empty() && result[0] == ' ' &&
+                !sctx->transcript.empty() && sctx->transcript.back() == ' ') {
+                result = result.substr(1);
+            }
+            sctx->transcript = full_transcript;
+        }
+
+        // Track approximate position (for emit interval calculation)
+        sctx->decoder_state.frame_offset = buffered / (8 * 160);
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    sctx->total_compute_seconds += elapsed.count();
+
+    return result;
+}
+
+std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
+    if (!sctx) return "";
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::string result;
+
+    // Process any remaining buffered audio
+    auto& cache = sctx->encoder_cache;
+    if (!cache.audio_buffer.empty()) {
+        // Final transcription of all accumulated audio
+        std::string full_transcript = nemo_transcribe_audio(
+            sctx->nctx,
+            cache.audio_buffer.data(),
+            cache.audio_buffer.size()
+        );
+
+        // Emit only the new portion
+        if (full_transcript.length() > sctx->transcript.length()) {
+            result = full_transcript.substr(sctx->transcript.length());
+            sctx->transcript = full_transcript;
+        }
+
+        cache.audio_buffer.clear();
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    sctx->total_compute_seconds += elapsed.count();
+
+    fprintf(stderr, "[STREAM] Finalized: %.2f sec audio, %.2f sec compute (RTF: %.3fx)\n",
+            sctx->total_audio_seconds,
+            sctx->total_compute_seconds,
+            sctx->total_compute_seconds / (sctx->total_audio_seconds + 0.001));
+
+    // Return full transcript
+    return sctx->transcript;
+}
+
 std::string nemo_stream_get_transcript(struct nemo_stream_context* sctx) {
     if (!sctx) return "";
-    
-    // For progress display: run transcription on what we have so far
-    // This is O(accumulated_audio) but only called periodically
-    if (sctx->encoder_cache.audio_buffer.empty()) {
-        return "";
-    }
-    
-    return nemo_transcribe_audio(
-        sctx->nctx,
-        sctx->encoder_cache.audio_buffer.data(),
-        sctx->encoder_cache.audio_buffer.size()
-    );
+    // Return accumulated transcript from true streaming
+    return sctx->transcript;
 }
 
 const std::vector<int>& nemo_stream_get_tokens(struct nemo_stream_context* sctx) {

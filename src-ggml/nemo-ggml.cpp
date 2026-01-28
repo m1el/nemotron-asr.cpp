@@ -1385,9 +1385,7 @@ std::string tokens_to_text(
             // SentencePiece convention: ▁ (U+2581, 3 bytes) means space/word start
             if (strncmp(piece.data(), "\xe2\x96\x81", 3) == 0) {
                 // UTF-8 for ▁ (U+2581)
-                if (!result.empty()) {
-                    result += ' ';
-                }
+                result += ' ';
                 if (timestamp_words) {
                     char buffer[32];
                     snprintf(buffer, sizeof(buffer), "{%.2f}", token.to_seconds());

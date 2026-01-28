@@ -10,11 +10,20 @@
 // Cache Configuration
 // =============================================================================
 
+// Latency mode presets for streaming ASR
+// Determines how much lookahead (right context) the encoder sees
+enum class nemo_latency_mode {
+    PURE_CAUSAL   = 0,   // att_right_context=0,  80ms  latency, chunk=8 mel frames
+    ULTRA_LOW     = 1,   // att_right_context=1,  160ms latency, chunk=16 mel frames  
+    LOW           = 6,   // att_right_context=6,  560ms latency, chunk=56 mel frames
+    DEFAULT       = 13,  // att_right_context=13, 1.12s latency, chunk=112 mel frames
+};
+
 // Streaming cache configuration for Nemotron-Speech model
 struct nemo_cache_config {
     // Attention cache settings
     int32_t att_left_context   = 70;     // Number of past frames to cache for attention
-    int32_t att_right_context  = 0;      // Lookahead frames (0 = pure causal, 1/6/13 = low latency options)
+    int32_t att_right_context  = 0;      // Lookahead frames (0=pure causal, 1/6/13 = other modes)
     int32_t cache_drop_size    = 0;      // Frames to drop from cache per step (0 for chunked_limited)
     
     // Convolution cache settings
@@ -34,7 +43,6 @@ struct nemo_cache_config {
     // Audio settings
     int32_t sample_rate        = 16000;  // Audio sample rate
     int32_t hop_length         = 160;    // Mel hop length (10ms at 16kHz)
-    int32_t chunk_samples      = 1280;   // Samples per chunk (80ms at 16kHz)
     
     // Decoder settings
     int32_t decoder_hidden     = 640;    // LSTM hidden size
@@ -42,9 +50,50 @@ struct nemo_cache_config {
     int32_t vocab_size         = 1025;   // Vocabulary size (including blank)
     int32_t blank_token        = 1024;   // Blank token ID
     
-    // Factory method for default configuration
+    // Compute chunk_mel_frames based on att_right_context
+    // Formula: chunk_size = subsampling_factor * (1 + att_right_context)
+    // For pure causal (att_right_context=0): 8 * 1 = 8 mel frames = 80ms
+    // For default (att_right_context=13): 8 * 14 = 112 mel frames = 1.12s
+    int32_t get_chunk_mel_frames() const {
+        return subsampling_factor * (1 + att_right_context);
+    }
+    
+    // Compute chunk audio samples based on latency mode
+    // chunk_samples = chunk_mel_frames * hop_length
+    int32_t get_chunk_samples() const {
+        return get_chunk_mel_frames() * hop_length;
+    }
+    
+    // Get latency in milliseconds
+    int32_t get_latency_ms() const {
+        return get_chunk_mel_frames() * hop_length * 1000 / sample_rate;
+    }
+    
+    // Factory methods for different latency modes
     static nemo_cache_config default_config() {
-        return nemo_cache_config{};
+        return with_latency(nemo_latency_mode::PURE_CAUSAL);
+    }
+    
+    static nemo_cache_config with_latency(nemo_latency_mode mode) {
+        nemo_cache_config cfg;
+        cfg.att_right_context = static_cast<int32_t>(mode);
+        return cfg;
+    }
+    
+    static nemo_cache_config pure_causal() {
+        return with_latency(nemo_latency_mode::PURE_CAUSAL);
+    }
+    
+    static nemo_cache_config ultra_low_latency() {
+        return with_latency(nemo_latency_mode::ULTRA_LOW);
+    }
+    
+    static nemo_cache_config low_latency() {
+        return with_latency(nemo_latency_mode::LOW);
+    }
+    
+    static nemo_cache_config balanced() {
+        return with_latency(nemo_latency_mode::DEFAULT);
     }
 };
 
@@ -103,9 +152,18 @@ struct nemo_encoder_cache {
     // Subsampling cache (for mel frames that don't fit complete chunk)
     std::vector<float> mel_buffer;   // Buffered mel frames
     int32_t mel_buffer_len;          // Number of buffered mel frames
-    
+
     // Audio buffer (for samples that don't fit complete chunk)
     std::vector<int16_t> audio_buffer;
+
+    // Streaming audio buffer for STFT overlap
+    // We need to keep some audio history for proper STFT windowing
+    std::vector<float> audio_history;  // Float audio with pre-emphasis applied
+    int32_t audio_history_len;         // Valid samples in history
+    float last_sample;                 // Last sample for pre-emphasis continuity
+
+    // Frame tracking for true streaming
+    int64_t total_encoder_frames;      // Total encoder frames processed so far
     
     // Initialization and reset
     void init(const nemo_cache_config& cfg);
@@ -156,21 +214,41 @@ struct nemo_encoder_graph {
 struct nemo_stream_context {
     // Base model context (not owned, must outlive stream context)
     struct nemo_context* nctx;
-    
+
     // Cache configuration
     nemo_cache_config config;
-    
+
     // Encoder caches
     nemo_encoder_cache encoder_cache;
-    
+
     // Decoder state
     nemo_decoder_state decoder_state;
-    
+
     // Pre-built encoder graph (reused across chunks)
     nemo_encoder_graph encoder_graph;
-    
+
+    // Pre-built decoder/joint graph (reused across decode steps)
+    struct ggml_context* decode_ctx;
+    struct ggml_cgraph* decode_graph;
+    ggml_gallocr_t decode_allocr;
+    struct ggml_tensor* decode_h_in;
+    struct ggml_tensor* decode_c_in;
+    struct ggml_tensor* decode_token_emb;
+    struct ggml_tensor* decode_enc_in;
+    struct ggml_tensor* decode_logits;
+    struct ggml_tensor* decode_h_out;
+    struct ggml_tensor* decode_c_out;
+    bool decode_graph_initialized;
+
+    // CPU-side copies of preprocessor weights for streaming mel conversion
+    std::vector<float> filterbank_cpu;   // [n_mels * n_bins]
+    std::vector<float> window_cpu;       // [n_window_size]
+
     // Accumulated tokens from this session
     std::vector<int> tokens;
+
+    // Accumulated transcript text
+    std::string transcript;
     
     // Timing stats
     double total_audio_seconds;
@@ -202,7 +280,18 @@ struct nemo_stream_context* nemo_stream_init(
 // audio: int16_t samples at config.sample_rate (16kHz), mono
 // n_samples: number of samples (can be any length, will buffer internally)
 // Returns: transcription of newly decoded tokens (may be empty if no new tokens)
+//
+// This version uses batch re-transcription for higher quality but O(N^2) complexity
 std::string nemo_stream_process(
+    struct nemo_stream_context* sctx,
+    const int16_t* audio,
+    int n_samples
+);
+
+// True incremental streaming using cached encoder
+// This processes audio incrementally without re-transcribing.
+// Lower latency but may have slight quality differences at chunk boundaries.
+std::string nemo_stream_process_incremental(
     struct nemo_stream_context* sctx,
     const int16_t* audio,
     int n_samples

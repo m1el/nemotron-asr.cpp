@@ -59,12 +59,16 @@ transcribe: src-ggml/transcribe.cpp $(GGML_SRCS)
 test_streaming: tests-ggml/test_streaming.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
+# Python reference comparison test
+test_python_ref: tests-ggml/test_python_reference.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
 # Streaming transcribe example
 transcribe_stream: src-ggml/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:
-	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream
+	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref
 
 test: test_ggml_weights test_ggml_compute
 	./test_ggml_weights
@@ -72,3 +76,6 @@ test: test_ggml_weights test_ggml_compute
 
 test_stream: test_streaming
 	./test_streaming
+
+test_ref: test_python_ref
+	./test_python_ref
