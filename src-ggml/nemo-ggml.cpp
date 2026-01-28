@@ -179,8 +179,8 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
     }
 
     // Add positional embedding tensor (precomputed)
-    // max_pos_len determines max audio length: max_pos_len * 8 * 10ms = max_audio_ms
-    // 1024 -> ~82 seconds, 2048 -> ~164 seconds
+    // max_pos_len determines max audio length for batch mode: max_pos_len * 8 * 10ms = max_audio_ms
+    // 2048 -> ~164 seconds for batch mode. Streaming mode has no length limit.
     const int max_pos_len = 2048;
     model.pos_emb = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32,
                                         model.hparams.d_model, 2 * max_pos_len - 1);

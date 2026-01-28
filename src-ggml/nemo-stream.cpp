@@ -878,6 +878,15 @@ static std::vector<int> decode_encoder_frame(
             }
         }
         
+        // Debug logging for first symbol of first few frames
+        static int debug_frame_count = 0;
+        if (sym == 0 && debug_frame_count < 10) {
+            fprintf(stderr, "[DEBUG] decode frame %d: best_token=%d (blank=%d), score=%.4f, logits[0..4]=%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                    debug_frame_count, best_token, blank_token, best_score,
+                    logits_data[0], logits_data[1], logits_data[2], logits_data[3], logits_data[4]);
+            debug_frame_count++;
+        }
+        
         if (best_token == blank_token) {
             // Blank: move to next time step
             ggml_gallocr_free(allocr);
@@ -964,84 +973,57 @@ std::string nemo_stream_process(
     return "";
 }
 
-// Process audio in streaming chunks using the cached encoder
-// This supports arbitrary-length audio since each chunk only needs
-// position embeddings for the local window (cache_len + chunk_len)
-// Note: Currently unused - batch encoder is faster on CPU. Keep for future GPU use.
-[[maybe_unused]]
-static std::string process_audio_streaming(struct nemo_stream_context* sctx) {
+// Process audio in chunks using the batch encoder
+// This approach processes audio in fixed-size chunks (e.g., 10 seconds each)
+// to support unlimited audio length while maintaining correct transcription.
+// Each chunk is processed independently through the batch encoder (which works correctly).
+static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
     struct nemo_context* nctx = sctx->nctx;
-    const int n_mels = sctx->config.n_mels;
-    const int subsample_factor = sctx->config.subsampling_factor;  // 8
+    const int sample_rate = sctx->config.sample_rate;
     
-    // Convert accumulated audio to mel spectrogram
-    std::vector<float> mel_data;
-    size_t n_mel_frames = nemo_preprocessor_process(
-        nctx->preprocessor,
-        sctx->encoder_cache.audio_buffer.data(),
-        sctx->encoder_cache.audio_buffer.size(),
-        mel_data
-    );
+    // Chunk size in samples (10 seconds per chunk = 160000 samples at 16kHz)
+    // This produces ~125 encoder frames per chunk, well within position embedding limits
+    const size_t chunk_samples = 10 * sample_rate;
     
-    if (n_mel_frames == 0) {
-        return "";
-    }
+    const size_t total_samples = sctx->encoder_cache.audio_buffer.size();
+    const int16_t* audio_data = sctx->encoder_cache.audio_buffer.data();
     
-    // Process mel frames in chunks of 8 (producing 1 encoder frame per chunk)
-    // This avoids the 512-frame limit in the batch encoder
-    std::vector<float> encoder_outputs;
-    const int d_model = sctx->config.d_model;
+    std::string full_transcript;
+    size_t processed_samples = 0;
+    int chunk_num = 0;
     
-    for (size_t mel_offset = 0; mel_offset + subsample_factor <= n_mel_frames; mel_offset += subsample_factor) {
-        // Extract chunk of mel frames (8 frames -> 1 encoder frame)
-        std::vector<float> mel_chunk(n_mels * subsample_factor);
-        for (int t = 0; t < subsample_factor; t++) {
-            for (int m = 0; m < n_mels; m++) {
-                mel_chunk[m + t * n_mels] = mel_data[(mel_offset + t) * n_mels + m];
+    while (processed_samples < total_samples) {
+        // Calculate chunk size for this iteration
+        size_t remaining = total_samples - processed_samples;
+        size_t this_chunk = std::min(remaining, chunk_samples);
+        
+        chunk_num++;
+        fprintf(stderr, "[STREAM] Processing chunk %d: samples %zu-%zu of %zu (%.1f-%.1f sec)\n",
+                chunk_num, processed_samples, processed_samples + this_chunk - 1, total_samples,
+                (double)processed_samples / sample_rate,
+                (double)(processed_samples + this_chunk) / sample_rate);
+        
+        // Use the batch transcription for each chunk (known to work correctly)
+        std::string chunk_text = nemo_transcribe_audio(
+            nctx,
+            audio_data + processed_samples,
+            this_chunk
+        );
+        
+        // Append to full transcript
+        if (!chunk_text.empty()) {
+            if (!full_transcript.empty()) {
+                full_transcript += " ";
             }
-        }
-        // Transpose to [n_mels, time] format
-        std::vector<float> mel_chunk_transposed(n_mels * subsample_factor);
-        for (int t = 0; t < subsample_factor; t++) {
-            for (int m = 0; m < n_mels; m++) {
-                mel_chunk_transposed[m * subsample_factor + t] = mel_chunk[t * n_mels + m];
-            }
+            full_transcript += chunk_text;
         }
         
-        // Process through cached encoder
-        auto enc_out = process_encoder_chunk_cached(sctx, mel_chunk_transposed.data(), subsample_factor);
-        if (!enc_out.empty()) {
-            encoder_outputs.insert(encoder_outputs.end(), enc_out.begin(), enc_out.end());
-        }
+        processed_samples += this_chunk;
     }
     
-    if (encoder_outputs.empty()) {
-        fprintf(stderr, "[DEBUG] No encoder outputs collected!\n");
-        return "";
-    }
+    fprintf(stderr, "[STREAM] Processed %d chunks, total tokens in transcript\n", chunk_num);
     
-    // Decode all encoder frames
-    int n_enc_frames = encoder_outputs.size() / d_model;
-    fprintf(stderr, "[DEBUG] Collected %d encoder frames, now decoding...\n", n_enc_frames);
-    
-    // Check if encoder output looks reasonable (not all zeros)
-    float enc_sum = 0.0f;
-    for (size_t i = 0; i < std::min(encoder_outputs.size(), (size_t)d_model); i++) {
-        enc_sum += fabsf(encoder_outputs[i]);
-    }
-    fprintf(stderr, "[DEBUG] First encoder frame L1 norm: %.6f\n", enc_sum);
-    
-    for (int f = 0; f < n_enc_frames; f++) {
-        auto new_toks = decode_encoder_frame(sctx, encoder_outputs.data() + f * d_model);
-        for (int tok : new_toks) {
-            sctx->tokens.push_back(tok);
-        }
-    }
-    
-    fprintf(stderr, "[DEBUG] Decoded %zu tokens\n", sctx->tokens.size());
-    
-    // Convert tokens to text
-    return tokens_to_text(sctx->tokens, nctx->model.vocab);
+    return full_transcript;
 }
 
 std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
@@ -1055,21 +1037,22 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
         size_t n_samples = sctx->encoder_cache.audio_buffer.size();
         double audio_seconds = (double)n_samples / sctx->config.sample_rate;
         
-        fprintf(stderr, "[DEBUG] nemo_stream_finalize: n_samples=%zu, audio_seconds=%.2f\n",
+        fprintf(stderr, "[STREAM] Finalizing: %zu samples (%.2f seconds)\n",
                 n_samples, audio_seconds);
         
-        // Use batch encoder - now supports up to ~164 seconds with max_pos_len=2048
-        result = nemo_transcribe_audio(
-            sctx->nctx,
-            sctx->encoder_cache.audio_buffer.data(),
-            sctx->encoder_cache.audio_buffer.size()
-        );
+        // Use chunked processing - each chunk uses the batch encoder
+        // This gives correct transcription while supporting unlimited audio length
+        result = process_audio_chunked(sctx);
         sctx->encoder_cache.audio_buffer.clear();
     }
     
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
     sctx->total_compute_seconds += elapsed.count();
+    
+    fprintf(stderr, "[STREAM] Compute time: %.2f seconds (RTF: %.3fx)\n",
+            elapsed.count(), 
+            elapsed.count() / ((double)sctx->encoder_cache.audio_buffer.size() / sctx->config.sample_rate + 0.001));
     
     return result;
 }
