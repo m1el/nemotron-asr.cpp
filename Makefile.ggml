@@ -33,13 +33,11 @@ GGML_STREAM_SRCS = src-ggml/nemo-stream.cpp
 # Original implementation (for comparison tests)
 ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp src/rnnt_decoder.cpp src/rnnt_joint.cpp src/greedy_decode.cpp src/tokenizer.cpp
 
-.PHONY: all clean test examples streaming
+.PHONY: all clean test transcribe streaming
 
-all: test_ggml_weights test_ggml_compute transcribe
+all: test_ggml_weights test_ggml_compute transcribe streaming
 
 streaming: test_streaming transcribe_stream
-
-examples: transcribe
 
 # Test weight loading
 test_ggml_weights: tests-ggml/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
@@ -62,7 +60,7 @@ test_streaming: tests-ggml/test_streaming.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Streaming transcribe example
-transcribe_stream: examples/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+transcribe_stream: src-ggml/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:
