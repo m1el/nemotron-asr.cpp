@@ -51,7 +51,7 @@ struct nemo_cache_config {
     int32_t blank_token        = 1024;   // Blank token ID
 
     // Streaming post-processing settings (from NeMo streaming_cfg)
-    int32_t valid_out_len      = 1;      // Number of encoder frames to output per chunk
+    // valid_out_len = 1 + att_right_context (number of encoder frames to output per chunk)
     int32_t drop_extra_pre_encoded = 2;  // Frames to drop from start after subsampling
     int32_t last_channel_cache_size = 70; // Max size for attention cache (same as att_left_context)
     int32_t pre_encode_cache_size = 9;   // Overlap mel frames for conv subsampling context
@@ -89,6 +89,14 @@ struct nemo_cache_config {
     // Get latency in milliseconds
     int32_t get_latency_ms() const {
         return get_chunk_mel_frames() * hop_length * 1000 / sample_rate;
+    }
+
+    // Get valid output length (encoder frames to output per chunk)
+    // For pure causal (right_context=0): 1 frame
+    // For right_context=6: 7 frames
+    // For right_context=13: 14 frames
+    int32_t get_valid_out_len() const {
+        return 1 + att_right_context;
     }
     
     // Factory methods for different latency modes

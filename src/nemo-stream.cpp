@@ -1005,7 +1005,7 @@ static std::string process_mel_chunk_streaming(
     // =========================================================================
     // 1. Truncate encoder output to valid_out_len frames
     //    NeMo: encoded = encoded[:, :, :valid_out_len]
-    int32_t valid_out_len = sctx->config.valid_out_len;
+    int32_t valid_out_len = sctx->config.get_valid_out_len();
     if (enc_out_frames > (size_t)valid_out_len) {
         // Only use first valid_out_len frames
         enc_out_frames = valid_out_len;
@@ -1120,6 +1120,7 @@ std::string nemo_stream_process_incremental(
 std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
     if (!sctx) return "";
 
+    #if 0
     // Print streaming statistics
     printf("\n[STREAMING STATS] Total chunks processed: %d\n", sctx->total_chunks_processed);
     printf("[STREAMING STATS] Total audio: %.2f seconds\n", sctx->total_audio_seconds);
@@ -1144,12 +1145,12 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
     printf("\n[STREAMING STATS] Config: chunk_mel_frames=%zu, shift_mel_frames=%zu, valid_out_len=%d\n",
            sctx->config.get_chunk_mel_frames(),
            sctx->config.get_shift_mel_frames(),
-           sctx->config.valid_out_len);
+           sctx->config.get_valid_out_len());
     printf("[STREAMING STATS] Config: att_left_context=%d, att_right_context=%d, drop_extra_pre_encoded=%d\n",
            sctx->config.att_left_context,
            sctx->config.att_right_context,
            sctx->config.drop_extra_pre_encoded);
-
+    #endif
     return sctx->transcript;
 }
 
