@@ -157,19 +157,18 @@ void nemo_encoder_graph::build_streaming_encoder(
         nctx->model.pos_emb->nb[1],
         pos_offset * nctx->model.pos_emb->nb[1]);
     
-    // Create cache input/output tensors for all layers
-    k_cache_ins.resize(n_layers);
-    v_cache_ins.resize(n_layers);
-    conv_cache_ins.resize(n_layers);
-    k_cache_outs.resize(n_layers);
-    v_cache_outs.resize(n_layers);
-    conv_cache_outs.resize(n_layers);
-    
-    for (int l = 0; l < n_layers; l++) {
-        k_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, cache_len);
-        v_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, cache_len);
-        conv_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, conv_cache_len);
-    }
+    // Create consolidated cache tensors for all layers
+    // Shape: [d_model, cache_len, n_layers] - layer is the outer dimension
+    k_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, cache_len, n_layers);
+    v_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, cache_len, n_layers);
+    conv_cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, conv_cache_len, n_layers);
+    ggml_set_name(k_cache, "k_cache");
+    ggml_set_name(v_cache, "v_cache");
+    ggml_set_name(conv_cache, "conv_cache");
+    // Mark as outputs so buffers persist across computations (views share these buffers)
+    ggml_set_output(k_cache);
+    ggml_set_output(v_cache);
+    ggml_set_output(conv_cache);
 
     // Create attention mask for invalid cache positions
     // Shape: [kv_len, 1] - will be broadcast across query positions and heads
@@ -183,10 +182,28 @@ void nemo_encoder_graph::build_streaming_encoder(
     // Process through all conformer layers with caching
     struct ggml_tensor* cur = subsampled;
 
+    // Strides for indexing into cache tensors
+    size_t k_layer_stride = k_cache->nb[2];
+    size_t v_layer_stride = v_cache->nb[2];
+    size_t conv_layer_stride = conv_cache->nb[2];
+
+    // Temporary storage for cache outputs from each layer
+    std::vector<struct ggml_tensor*> k_cache_outs(n_layers);
+    std::vector<struct ggml_tensor*> v_cache_outs(n_layers);
+    std::vector<struct ggml_tensor*> conv_cache_outs(n_layers);
+
     for (int l = 0; l < n_layers; l++) {
+        // Create views into the consolidated cache tensors for this layer
+        struct ggml_tensor* k_cache_in = ggml_view_2d(ctx, k_cache,
+            d_model, cache_len, k_cache->nb[1], l * k_layer_stride);
+        struct ggml_tensor* v_cache_in = ggml_view_2d(ctx, v_cache,
+            d_model, cache_len, v_cache->nb[1], l * v_layer_stride);
+        struct ggml_tensor* conv_cache_in = ggml_view_2d(ctx, conv_cache,
+            d_model, conv_cache_len, conv_cache->nb[1], l * conv_layer_stride);
+
         cur = build_cached_conformer_layer(
             ctx, cur,
-            k_cache_ins[l], v_cache_ins[l], conv_cache_ins[l],
+            k_cache_in, v_cache_in, conv_cache_in,
             pos_emb, attn_mask,
             &nctx->model.encoder.layers[l],
             &cfg,
@@ -194,27 +211,29 @@ void nemo_encoder_graph::build_streaming_encoder(
             l  // Pass layer index for debugging
         );
     }
-    
+
     encoder_out = cur;
-    // ggml_set_name(encoder_out, "encoder_out");
-    // ggml_set_output(encoder_out);
-    
-    for (int l = 0; l < n_layers; l++) {
-        k_cache_ins[l] = ggml_cpy(ctx, k_cache_outs[l], k_cache_ins[l]);
-        ggml_set_output(k_cache_ins[l]);
-        v_cache_ins[l] = ggml_cpy(ctx, v_cache_outs[l], v_cache_ins[l]);
-        ggml_set_output(v_cache_ins[l]);
-        conv_cache_ins[l] = ggml_cpy(ctx, conv_cache_outs[l], conv_cache_ins[l]);
-        ggml_set_output(conv_cache_ins[l]);
-    }
-    
+
     // Build the compute graph
     graph = ggml_new_graph_custom(ctx, 16384, false);
     ggml_build_forward_expand(graph, encoder_out);
+
+    // Copy cache outputs back to the consolidated cache tensors
     for (int l = 0; l < n_layers; l++) {
-        ggml_build_forward_expand(graph, k_cache_ins[l]);
-        ggml_build_forward_expand(graph, v_cache_ins[l]);
-        ggml_build_forward_expand(graph, conv_cache_ins[l]);
+        struct ggml_tensor* k_dst = ggml_view_2d(ctx, k_cache,
+            d_model, cache_len, k_cache->nb[1], l * k_layer_stride);
+        struct ggml_tensor* v_dst = ggml_view_2d(ctx, v_cache,
+            d_model, cache_len, v_cache->nb[1], l * v_layer_stride);
+        struct ggml_tensor* conv_dst = ggml_view_2d(ctx, conv_cache,
+            d_model, conv_cache_len, conv_cache->nb[1], l * conv_layer_stride);
+
+        k_dst = ggml_cpy(ctx, k_cache_outs[l], k_dst);
+        v_dst = ggml_cpy(ctx, v_cache_outs[l], v_dst);
+        conv_dst = ggml_cpy(ctx, conv_cache_outs[l], conv_dst);
+
+        ggml_build_forward_expand(graph, k_dst);
+        ggml_build_forward_expand(graph, v_dst);
+        ggml_build_forward_expand(graph, conv_dst);
     }
 }
 
@@ -268,14 +287,13 @@ void nemo_encoder_graph::init(struct nemo_context* nctx, const nemo_cache_config
     const int cache_len = cfg.att_left_context;
     const int conv_cache_len = cfg.conv_kernel_size - 1;
 
-    std::vector<float> zeros_attn(d_model * cache_len, 0.0f);
-    std::vector<float> zeros_conv(d_model * conv_cache_len, 0.0f);
+    // Initialize entire cache tensors at once
+    std::vector<float> zeros_kv(d_model * cache_len * n_layers, 0.0f);
+    std::vector<float> zeros_conv(d_model * conv_cache_len * n_layers, 0.0f);
 
-    for (int l = 0; l < n_layers; l++) {
-        ggml_backend_tensor_set(k_cache_ins[l], zeros_attn.data(), 0, zeros_attn.size() * sizeof(float));
-        ggml_backend_tensor_set(v_cache_ins[l], zeros_attn.data(), 0, zeros_attn.size() * sizeof(float));
-        ggml_backend_tensor_set(conv_cache_ins[l], zeros_conv.data(), 0, zeros_conv.size() * sizeof(float));
-    }
+    ggml_backend_tensor_set(k_cache, zeros_kv.data(), 0, zeros_kv.size() * sizeof(float));
+    ggml_backend_tensor_set(v_cache, zeros_kv.data(), 0, zeros_kv.size() * sizeof(float));
+    ggml_backend_tensor_set(conv_cache, zeros_conv.data(), 0, zeros_conv.size() * sizeof(float));
     // Sync to ensure initialization completes before compute
     // ggml_backend_synchronize(nctx->model.backend);
 

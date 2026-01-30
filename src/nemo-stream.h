@@ -145,20 +145,21 @@ struct nemo_encoder_graph {
     // Input tensors (set data before compute)
     struct ggml_tensor* mel_input;     // [n_mels, chunk_frames, 1]
     struct ggml_tensor* attn_mask;     // [kv_len, 1] attention mask for invalid cache positions
-    std::vector<struct ggml_tensor*> k_cache_ins;   // [n_layers]
-    std::vector<struct ggml_tensor*> v_cache_ins;   // [n_layers]
-    std::vector<struct ggml_tensor*> conv_cache_ins; // [n_layers]
-    
+
+    // Cache tensors - single tensors with layer dimension, views used per-layer
+    struct ggml_tensor* k_cache;       // [d_model, cache_len, n_layers]
+    struct ggml_tensor* v_cache;       // [d_model, cache_len, n_layers]
+    struct ggml_tensor* conv_cache;    // [d_model, conv_cache_len, n_layers]
+
     // Output tensors (read data after compute)
     struct ggml_tensor* encoder_out;   // [d_model, chunk_len]
-    std::vector<struct ggml_tensor*> k_cache_outs;  // [n_layers]
-    std::vector<struct ggml_tensor*> v_cache_outs;  // [n_layers]
-    std::vector<struct ggml_tensor*> conv_cache_outs; // [n_layers]
     
     bool initialized;
     
     nemo_encoder_graph() : ctx(nullptr), graph(nullptr), allocr(nullptr),
-                           mel_input(nullptr), attn_mask(nullptr), encoder_out(nullptr), initialized(false) {}
+                           mel_input(nullptr), attn_mask(nullptr),
+                           k_cache(nullptr), v_cache(nullptr), conv_cache(nullptr),
+                           encoder_out(nullptr), initialized(false) {}
     ~nemo_encoder_graph();
     
     void init(struct nemo_context* nctx, const nemo_cache_config& cfg);
