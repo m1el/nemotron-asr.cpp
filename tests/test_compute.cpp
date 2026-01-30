@@ -1,14 +1,14 @@
 // Test that ggml computation produces same results as original implementation
-#include "../src-ggml/nemo-ggml.h"
-#include "../include/ggml_weights.h"
-#include "../include/ops.h"
-#include "../include/conv_subsampling.h"
-#include "../include/conformer_modules.h"
-#include "../include/conformer_encoder.h"
-#include "../include/rnnt_decoder.h"
-#include "../include/rnnt_joint.h"
-#include "../include/greedy_decode.h"
-#include "../include/tokenizer.h"
+#include "../src/nemo-ggml.h"
+#include "../src/reference/include/ggml_weights.h"
+#include "../src/reference/include/ops.h"
+#include "../src/reference/include/conv_subsampling.h"
+#include "../src/reference/include/conformer_modules.h"
+#include "../src/reference/include/conformer_encoder.h"
+#include "../src/reference/include/rnnt_decoder.h"
+#include "../src/reference/include/rnnt_joint.h"
+#include "../src/reference/include/greedy_decode.h"
+#include "../src/reference/include/tokenizer.h"
 
 #include <cstdio>
 #include <cmath>

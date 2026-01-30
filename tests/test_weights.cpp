@@ -1,6 +1,6 @@
 // Test ggml/GGUF weight loading and compare with original implementation
-#include "../src-ggml/nemo-ggml.h"
-#include "../include/ggml_weights.h"
+#include "../src/nemo-ggml.h"
+#include "../src/reference/include/ggml_weights.h"
 
 #include <cstdio>
 #include <cmath>
