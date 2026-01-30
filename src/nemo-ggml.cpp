@@ -10,6 +10,7 @@
 // Maximum nodes in computation graph
 #define NEMO_MAX_NODES 8192
 
+
 // Compute positional embeddings (sinusoidal)
 // NeMo convention: pos[0] = most positive position, pos[total_len-1] = most negative
 // i.e., stored in descending order: +max_len-1, +max_len-2, ..., 0, ..., -(max_len-1)
@@ -183,7 +184,7 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
             continue;
         }
 
-        // Create tensor in our context with same dimensions
+        // Keep original type - quantized tensors stay quantized, ggml_mul_mat handles dequant
         struct ggml_tensor * tensor = ggml_dup_tensor(model.ctx_w, meta_tensor);
         ggml_set_name(tensor, name);
         model.tensors[name] = tensor;
@@ -240,7 +241,8 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
             return false;
         }
 
-        // Set tensor data in backend
+        // Set tensor data directly - quantized tensors stay quantized
+        // ggml_mul_mat handles dequantization on-the-fly during inference
         ggml_backend_tensor_set(tensor, buf.data(), 0, tensor_size);
     }
 
@@ -304,9 +306,20 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
         layer.norm_final_w = model.tensors[prefix + ".norm_out.weight"];
         layer.norm_final_b = model.tensors[prefix + ".norm_out.bias"];
 
+        // Validate conv weights are 2D (new format) not 3D (old format)
+        if (i == 0) {
+            if (layer.conv_pw1_w && ggml_n_dims(layer.conv_pw1_w) != 2) {
+                fprintf(stderr, "%s: ERROR: conv weights are 3D (old format). Please reconvert the model with updated convert_to_gguf.py\n", __func__);
+                fprintf(stderr, "%s: conv_pw1_w has %d dims, expected 2\n", __func__, ggml_n_dims(layer.conv_pw1_w));
+                gguf_free(gguf_ctx);
+                ggml_free(ctx_meta);
+                return false;
+            }
+        }
+
         // Infer kernel_size from first layer's depthwise conv weight
         if (i == 0 && layer.conv_dw_w) {
-            // Weight shape in GGML is [kernel_size, 1, d_model]
+            // Weight shape in GGML is [kernel_size, d_model] (stored as 2D)
             model.hparams.kernel_size = layer.conv_dw_w->ne[0];
         }
     }
@@ -670,11 +683,11 @@ static struct ggml_tensor * build_rel_pos_mha(
 static struct ggml_tensor * build_conformer_conv(
     struct ggml_context * ctx,
     struct ggml_tensor * input,     // [d_model, time, batch]
-    struct ggml_tensor * pw1_w,     // [1, d_model, 2*d_model] pointwise conv1
-    struct ggml_tensor * dw_w,      // [kernel_size, 1, d_model] depthwise conv
+    struct ggml_tensor * pw1_w,     // [d_model, 2*d_model] pointwise conv1 (stored as 2D)
+    struct ggml_tensor * dw_w,      // [kernel_size, d_model] depthwise conv (stored as 2D)
     struct ggml_tensor * ln_w,      // [d_model] layer norm weight
     struct ggml_tensor * ln_b,      // [d_model] layer norm bias
-    struct ggml_tensor * pw2_w,     // [1, d_model, d_model] pointwise conv2
+    struct ggml_tensor * pw2_w,     // [d_model, d_model] pointwise conv2 (stored as 2D)
     int kernel_size
 ) {
     int64_t d_model = input->ne[0];
@@ -682,9 +695,8 @@ static struct ggml_tensor * build_conformer_conv(
     int64_t batch = input->ne[2];
 
     // Pointwise Conv1: [d_model, seq_len, batch] -> [2*d_model, seq_len, batch]
-    // pw1_w is [1, d_model, 2*d_model], reshape to [d_model, 2*d_model] for matmul
-    struct ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, pw1_w, d_model, 2 * d_model);
-    struct ggml_tensor * cur = ggml_mul_mat(ctx, pw1_w_2d, input);
+    // pw1_w is [d_model, 2*d_model] - already 2D, use directly for matmul
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, pw1_w, input);
 
     // GLU: split in half, multiply first half by sigmoid of second half
     // cur: [2*d_model, seq_len, batch] -> [d_model, seq_len, batch]
@@ -706,9 +718,8 @@ static struct ggml_tensor * build_conformer_conv(
 
     // Depthwise conv1d: for each position t in output, sum over k:
     // output[c, t] = sum_k input[c, t+k] * weight[c, k]
-    // Weight is [kernel_size, 1, d_model], reshape to [kernel_size, d_model]
-    struct ggml_tensor * dw_w_2d = ggml_reshape_2d(ctx, dw_w, kernel_size, d_model);
-    struct ggml_tensor * dw_w_t = ggml_cont(ctx, ggml_transpose(ctx, dw_w_2d));
+    // dw_w is [kernel_size, d_model] - already 2D, transpose to [d_model, kernel_size]
+    struct ggml_tensor * dw_w_t = ggml_cont(ctx, ggml_transpose(ctx, dw_w));
     // dw_w_t: [d_model, kernel_size]
 
     struct ggml_tensor * conv_result = nullptr;
@@ -745,8 +756,8 @@ static struct ggml_tensor * build_conformer_conv(
     cur = ggml_silu(ctx, cur);
 
     // Pointwise Conv2: [d_model, seq_len, batch] -> [d_model, seq_len, batch]
-    struct ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx, pw2_w, d_model, d_model);
-    cur = ggml_mul_mat(ctx, pw2_w_2d, cur);
+    // pw2_w is [d_model, d_model] - already 2D, use directly for matmul
+    cur = ggml_mul_mat(ctx, pw2_w, cur);
 
     return cur;
 }

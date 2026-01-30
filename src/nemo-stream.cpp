@@ -7,6 +7,7 @@
 #include <chrono>
 #include <algorithm>
 
+typedef long long int lli;
 // Forward declaration from nemo-ggml.cpp
 std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab);
 
@@ -308,7 +309,7 @@ struct ggml_tensor* build_cached_causal_conv1d(
     struct ggml_context* ctx,
     struct ggml_tensor* x,              // [d_model, seq_len, batch]
     struct ggml_tensor* cache_in,       // [d_model, kernel_size-1] or nullptr
-    struct ggml_tensor* weight,         // [kernel_size, 1, d_model]
+    struct ggml_tensor* weight,         // [kernel_size, d_model] (stored as 2D)
     int kernel_size,
     struct ggml_tensor** cache_out      // Output: updated cache
 ) {
@@ -316,9 +317,9 @@ struct ggml_tensor* build_cached_causal_conv1d(
     int64_t seq_len = x->ne[1];
     int64_t batch = x->ne[2];
     int64_t cache_len = kernel_size - 1;
-    
+
     struct ggml_tensor* x_padded;
-    
+
     if (cache_in != nullptr) {
         // Prepend cache to input: [d_model, cache_len + seq_len, batch]
         // First, expand cache to have batch dimension
@@ -329,14 +330,13 @@ struct ggml_tensor* build_cached_causal_conv1d(
         // First chunk: zero-pad left
         x_padded = ggml_pad_ext(ctx, x, 0, 0, cache_len, 0, 0, 0, 0, 0);
     }
-    
+
     // x_padded: [d_model, cache_len + seq_len, batch]
     // Permute to [seq_len + cache_len, d_model, batch] for conv
     struct ggml_tensor* x_perm = ggml_cont(ctx, ggml_permute(ctx, x_padded, 1, 0, 2, 3));
-    
-    // Reshape weight: [kernel_size, 1, d_model] -> [kernel_size, d_model]
-    struct ggml_tensor* w_2d = ggml_reshape_2d(ctx, weight, kernel_size, d_model);
-    struct ggml_tensor* w_t = ggml_cont(ctx, ggml_transpose(ctx, w_2d));  // [d_model, kernel_size]
+
+    // weight is [kernel_size, d_model] - already 2D, just transpose to [d_model, kernel_size]
+    struct ggml_tensor* w_t = ggml_cont(ctx, ggml_transpose(ctx, weight));
     
     // Manual depthwise conv1d
     struct ggml_tensor* conv_result = nullptr;
@@ -623,8 +623,8 @@ struct ggml_tensor* build_cached_conformer_layer(
     int64_t seq_len = cur->ne[1];
     int64_t batch = cur->ne[2];
     
-    struct ggml_tensor* pw1_w_2d = ggml_reshape_2d(ctx, layer->conv_pw1_w, d_model, 2 * d_model);
-    struct ggml_tensor* conv_cur = ggml_mul_mat(ctx, pw1_w_2d, cur);
+    // conv_pw1_w is [d_model, 2*d_model] - already 2D, use directly for matmul
+    struct ggml_tensor* conv_cur = ggml_mul_mat(ctx, layer->conv_pw1_w, cur);
     
     // GLU
     int64_t half_ch = d_model;
@@ -646,8 +646,8 @@ struct ggml_tensor* build_cached_conformer_layer(
     conv_cur = ggml_add(ctx, conv_cur, layer->conv_ln_b);
     conv_cur = ggml_silu(ctx, conv_cur);
     
-    struct ggml_tensor* pw2_w_2d = ggml_reshape_2d(ctx, layer->conv_pw2_w, d_model, d_model);
-    conv_cur = ggml_mul_mat(ctx, pw2_w_2d, conv_cur);
+    // conv_pw2_w is [d_model, d_model] - already 2D, use directly for matmul
+    conv_cur = ggml_mul_mat(ctx, layer->conv_pw2_w, conv_cur);
     
     residual = ggml_add(ctx, residual, conv_cur);
     
@@ -911,8 +911,8 @@ void append_dump_array(
     for (int i = 0; i < 4; i++) {
         if (info.shape[i] != ne[i]) {
             fprintf(stderr, "[ERROR] Shape mismatch for dump file: %s\n", filename);
-            fprintf(stderr, "Expected shape: [%lld, %lld, %lld, %lld]\n", info.shape[0], info.shape[1], info.shape[2], info.shape[3]);
-            fprintf(stderr, "Actual shape:   [%lld, %lld, %lld, %lld]\n", ne[0], ne[1], ne[2], ne[3]);
+            fprintf(stderr, "Expected shape: [%lld, %lld, %lld, %lld]\n", (lli)info.shape[0], (lli)info.shape[1], (lli)info.shape[2], (lli)info.shape[3]);
+            fprintf(stderr, "Actual shape:   [%lld, %lld, %lld, %lld]\n", (lli)ne[0], (lli)ne[1], (lli)ne[2], (lli)ne[3]);
             return;
         }
     }
@@ -947,7 +947,7 @@ void append_dump_tensor(
         printf("Dumping tensor '%s' to %s, shape: ", name, filename);
         const char * sep = "";
         for (size_t i = 0; i < ndim; i++) {
-            printf("%s%lld", sep, tensor->ne[i]);
+            printf("%s%lld", sep, (lli)tensor->ne[i]);
             sep = ", ";
             size_t dim_size = tensor->ne[i];
             (void)dim_size;

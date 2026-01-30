@@ -664,7 +664,8 @@ bool test_cached_conformer_layer(struct nemo_context* ctx) {
         nullptr,  // No attention mask for uncached inference
         &ctx->model.encoder.layers[0],
         &config,
-        &k_cache_out, &v_cache_out, &conv_cache_out
+        &k_cache_out, &v_cache_out, &conv_cache_out,
+        0  // layer_idx
     );
     
     ggml_set_output(out);
