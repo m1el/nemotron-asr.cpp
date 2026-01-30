@@ -100,7 +100,7 @@ struct nemo_conformer_layer {
     struct ggml_tensor * norm_conv_w;
     struct ggml_tensor * norm_conv_b;
     struct ggml_tensor * conv_pw1_w;      // [1024, 2048] reshaped from PyTorch (2048, 1024, 1)
-    struct ggml_tensor * conv_dw_w;       // [31, 1024] reshaped from PyTorch (1024, 1, 31)
+    struct ggml_tensor * conv_dw_w;       // [1024, 31] reshaped+transposed from PyTorch (1024, 1, 31)
     struct ggml_tensor * conv_ln_w;       // [1024]
     struct ggml_tensor * conv_ln_b;       // [1024]
     struct ggml_tensor * conv_pw2_w;      // [1024, 1024] reshaped from PyTorch (1024, 1024, 1)

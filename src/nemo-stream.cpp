@@ -309,7 +309,7 @@ struct ggml_tensor* build_cached_causal_conv1d(
     struct ggml_context* ctx,
     struct ggml_tensor* x,              // [d_model, seq_len, batch]
     struct ggml_tensor* cache_in,       // [d_model, kernel_size-1] or nullptr
-    struct ggml_tensor* weight,         // [kernel_size, d_model] (stored as 2D)
+    struct ggml_tensor* weight,         // [d_model, kernel_size] (stored pre-transposed)
     int kernel_size,
     struct ggml_tensor** cache_out      // Output: updated cache
 ) {
@@ -335,9 +335,8 @@ struct ggml_tensor* build_cached_causal_conv1d(
     // Permute to [seq_len + cache_len, d_model, batch] for conv
     struct ggml_tensor* x_perm = ggml_cont(ctx, ggml_permute(ctx, x_padded, 1, 0, 2, 3));
 
-    // weight is [kernel_size, d_model] - already 2D, just transpose to [d_model, kernel_size]
-    struct ggml_tensor* w_t = ggml_cont(ctx, ggml_transpose(ctx, weight));
-    
+    // weight is [d_model, kernel_size] - stored pre-transposed for quantization
+
     // Manual depthwise conv1d
     struct ggml_tensor* conv_result = nullptr;
     for (int k = 0; k < kernel_size; k++) {
@@ -346,9 +345,9 @@ struct ggml_tensor* build_cached_causal_conv1d(
             seq_len, d_model, batch,
             x_perm->nb[1], x_perm->nb[2],
             k * sizeof(float));
-        
+
         // Get k-th kernel element for each channel: [d_model]
-        struct ggml_tensor* kernel_k = ggml_view_1d(ctx, w_t, d_model, k * d_model * sizeof(float));
+        struct ggml_tensor* kernel_k = ggml_view_1d(ctx, weight, d_model, k * d_model * sizeof(float));
         kernel_k = ggml_reshape_3d(ctx, kernel_k, 1, d_model, 1);
         
         // Multiply and accumulate

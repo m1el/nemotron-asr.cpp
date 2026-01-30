@@ -319,8 +319,8 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
 
         // Infer kernel_size from first layer's depthwise conv weight
         if (i == 0 && layer.conv_dw_w) {
-            // Weight shape in GGML is [kernel_size, d_model] (stored as 2D)
-            model.hparams.kernel_size = layer.conv_dw_w->ne[0];
+            // Weight shape in GGML is [d_model, kernel_size] (stored pre-transposed)
+            model.hparams.kernel_size = layer.conv_dw_w->ne[1];
         }
     }
 
@@ -684,7 +684,7 @@ static struct ggml_tensor * build_conformer_conv(
     struct ggml_context * ctx,
     struct ggml_tensor * input,     // [d_model, time, batch]
     struct ggml_tensor * pw1_w,     // [d_model, 2*d_model] pointwise conv1 (stored as 2D)
-    struct ggml_tensor * dw_w,      // [kernel_size, d_model] depthwise conv (stored as 2D)
+    struct ggml_tensor * dw_w,      // [d_model, kernel_size] depthwise conv (stored pre-transposed)
     struct ggml_tensor * ln_w,      // [d_model] layer norm weight
     struct ggml_tensor * ln_b,      // [d_model] layer norm bias
     struct ggml_tensor * pw2_w,     // [d_model, d_model] pointwise conv2 (stored as 2D)
@@ -718,9 +718,7 @@ static struct ggml_tensor * build_conformer_conv(
 
     // Depthwise conv1d: for each position t in output, sum over k:
     // output[c, t] = sum_k input[c, t+k] * weight[c, k]
-    // dw_w is [kernel_size, d_model] - already 2D, transpose to [d_model, kernel_size]
-    struct ggml_tensor * dw_w_t = ggml_cont(ctx, ggml_transpose(ctx, dw_w));
-    // dw_w_t: [d_model, kernel_size]
+    // dw_w is [d_model, kernel_size] - stored pre-transposed for quantization
 
     struct ggml_tensor * conv_result = nullptr;
     for (int k = 0; k < kernel_size; k++) {
@@ -731,7 +729,7 @@ static struct ggml_tensor * build_conformer_conv(
             k * sizeof(float));
 
         // Get k-th kernel element for each channel
-        struct ggml_tensor * kernel_k = ggml_view_1d(ctx, dw_w_t, d_model, k * d_model * sizeof(float));
+        struct ggml_tensor * kernel_k = ggml_view_1d(ctx, dw_w, d_model, k * d_model * sizeof(float));
         kernel_k = ggml_reshape_3d(ctx, kernel_k, 1, d_model, 1);
 
         // Multiply and accumulate

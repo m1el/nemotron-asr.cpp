@@ -199,7 +199,7 @@ def get_conv_reshape_type(name: str) -> str | None:
 
     Returns:
         'pointwise' - squeeze kernel dim (out, in, 1) -> (out, in)
-        'depthwise' - squeeze groups dim (out, 1, k) -> (out, k)
+        'depthwise' - squeeze groups dim and transpose (out, 1, k) -> (k, out)
         None - no special handling
     """
     if re.search(r"\.conv\.(pointwise_conv1|pointwise_conv2)\.weight$", name):
@@ -211,7 +211,8 @@ def get_conv_reshape_type(name: str) -> str | None:
 
 def should_skip_quantization(name: str) -> bool:
     """Check if tensor should be excluded from quantization."""
-    # Depthwise conv has small kernel_size as ne[0], can't be quantized
+    # Depthwise conv uses manual loop with ggml_view_1d which doesn't work with quantized tensors
+    # It's tiny anyway (~31KB per layer F32)
     if re.search(r"\.conv\.depthwise_conv\.weight$", name):
         return True
     return False
@@ -328,12 +329,12 @@ def convert_to_gguf(
             data = data.squeeze(axis=2)
             print(f"  -> squeezed pointwise to 2D: {data.shape}")
         elif conv_type == 'depthwise' and len(data.shape) == 3:
-            # depthwise: (out_ch, 1, kernel) -> (out_ch, kernel) - squeeze groups dim
+            # depthwise: (out_ch, 1, kernel) -> (kernel, out_ch)
+            # Squeeze groups dim then transpose to make ne[0]=out_ch>=32 for quantization
             assert data.shape[1] == 1, f"Expected groups=1 for depthwise conv {name}, got {data.shape[1]}"
-            data = data.squeeze(axis=1)
-            print(f"  -> squeezed depthwise to 2D: {data.shape}")
+            data = data.squeeze(axis=1).T  # (out_ch, kernel) -> (kernel, out_ch)
+            print(f"  -> squeezed+transposed depthwise to 2D: {data.shape}")
 
-        # Verify conv weights can be quantized (ne[0] = last dim in numpy >= 32)
         # GGUF uses row-major with dimensions in reverse order
         shape_gguf = list(reversed(data.shape))
         while len(shape_gguf) < 4:
@@ -345,7 +346,7 @@ def convert_to_gguf(
         do_quantize = (
             ggml_quant_type != GGML_TYPE_F32
             and should_quantize(name, quant_patterns, exclude_patterns)
-            and not should_skip_quantization(name)  # Skip tensors with small ne[0]
+            and not should_skip_quantization(name)  # Depthwise conv uses view ops, can't quantize
             and n_elements >= 256  # Don't quantize tiny tensors
             and len(data.shape) >= 2  # Only quantize matrices
         )
