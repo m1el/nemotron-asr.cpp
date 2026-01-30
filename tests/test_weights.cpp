@@ -1,186 +1,136 @@
-#include "ggml_weights.h"
+// Test ggml/GGUF weight loading and compare with original implementation
+#include "../src-ggml/nemo-ggml.h"
+#include "../include/ggml_weights.h"
 
-#include <cmath>
 #include <cstdio>
+#include <cmath>
+#include <cstring>
 
-using namespace nemo;
+// Compare two tensors
+bool compare_tensors(struct ggml_tensor * ggml_t, const nemo::Tensor & ref, const char * name) {
+    // Check element count
+    size_t ggml_numel = ggml_nelements(ggml_t);
+    size_t ref_numel = ref.numel();
 
-void test_tensor_shapes(const ModelWeights& weights) {
-    printf("\n=== Testing tensor shapes ===\n");
+    if (ggml_numel != ref_numel) {
+        printf("FAIL %s: element count mismatch (ggml=%zu, ref=%zu)\n", name, ggml_numel, ref_numel);
+        return false;
+    }
 
-    // Test pre_encode weights
-    {
-        const auto& t = weights.require("encoder.pre_encode.out.weight");
-        if (t.shape.size() != 2 || t.shape[0] != 1024 || t.shape[1] != 4352) {
-            printf("FAIL: pre_encode.out.weight shape mismatch\n");
+    // Get ggml data
+    std::vector<float> ggml_data(ggml_numel);
+    ggml_backend_tensor_get(ggml_t, ggml_data.data(), 0, ggml_numel * sizeof(float));
+
+    // Compare values
+    float max_diff = 0.0f;
+    float sum_diff = 0.0f;
+    for (size_t i = 0; i < ggml_numel; i++) {
+        float diff = std::abs(ggml_data[i] - ref.data[i]);
+        max_diff = std::max(max_diff, diff);
+        sum_diff += diff;
+    }
+
+    float mean_diff = sum_diff / ggml_numel;
+
+    if (max_diff > 1e-5f) {
+        printf("FAIL %s: max_diff=%.6e, mean_diff=%.6e\n", name, max_diff, mean_diff);
+
+        // Print first few values
+        printf("  ggml[0:5]: ");
+        for (int i = 0; i < std::min(5, (int)ggml_numel); i++) {
+            printf("%.6f ", ggml_data[i]);
+        }
+        printf("\n  ref[0:5]:  ");
+        for (int i = 0; i < std::min(5, (int)ref_numel); i++) {
+            printf("%.6f ", ref.data[i]);
+        }
+        printf("\n");
+        return false;
+    }
+
+    printf("PASS %s: max_diff=%.6e, mean_diff=%.6e\n", name, max_diff, mean_diff);
+    return true;
+}
+
+int main() {
+    printf("=== Testing GGUF Weight Loading ===\n\n");
+
+    // Load with original implementation
+    printf("Loading weights with original implementation (model.bin)...\n");
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return 1;
+    }
+    printf("\n");
+
+    // Load with ggml implementation (GGUF format)
+    printf("Loading weights with ggml implementation (model.gguf)...\n");
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return 1;
+    }
+    printf("\n");
+
+    // Compare key tensors
+    printf("=== Comparing Tensors ===\n\n");
+
+    int passed = 0;
+    int failed = 0;
+
+    auto test_tensor = [&](const char * name) {
+        auto it = ctx->model.tensors.find(name);
+        if (it == ctx->model.tensors.end()) {
+            printf("SKIP %s: not in ggml model\n", name);
             return;
         }
-        printf("OK: pre_encode.out.weight [1024, 4352]\n");
-    }
+        struct ggml_tensor * ggml_t = it->second;
+
+        const auto * ref_t = ref_weights.get(name);
+        if (!ref_t) {
+            printf("SKIP %s: not in reference\n", name);
+            return;
+        }
+
+        if (compare_tensors(ggml_t, *ref_t, name)) {
+            passed++;
+        } else {
+            failed++;
+        }
+    };
 
     // Test conv subsampling
-    {
-        const auto& t = weights.require("encoder.pre_encode.conv.0.weight");
-        if (t.shape.size() != 4 || t.shape[0] != 256 || t.shape[1] != 1 ||
-            t.shape[2] != 3 || t.shape[3] != 3) {
-            printf("FAIL: conv.0.weight shape mismatch\n");
-            return;
-        }
-        printf("OK: conv.0.weight [256, 1, 3, 3]\n");
-    }
+    test_tensor("encoder.pre_encode.conv.0.weight");
+    test_tensor("encoder.pre_encode.conv.0.bias");
+    test_tensor("encoder.pre_encode.out.weight");
 
-    // Test layer 0 attention weights
-    {
-        const auto& t = weights.require("encoder.layers.0.self_attn.linear_q.weight");
-        if (t.shape.size() != 2 || t.shape[0] != 1024 || t.shape[1] != 1024) {
-            printf("FAIL: linear_q.weight shape mismatch\n");
-            return;
-        }
-        printf("OK: layers.0.self_attn.linear_q.weight [1024, 1024]\n");
-    }
+    // Test layer 0 weights
+    test_tensor("encoder.layers.0.norm_feed_forward1.weight");
+    test_tensor("encoder.layers.0.feed_forward1.linear1.weight");
+    test_tensor("encoder.layers.0.self_attn.linear_q.weight");
+    test_tensor("encoder.layers.0.self_attn.pos_bias_u");
+    test_tensor("encoder.layers.0.conv_module.pointwise_conv1.weight");
+    test_tensor("encoder.layers.0.conv_module.depthwise_conv.weight");
 
-    // Test decoder embedding
-    {
-        const auto& t = weights.require("decoder.prediction.embed.weight");
-        if (t.shape.size() != 2 || t.shape[0] != 1025 || t.shape[1] != 640) {
-            printf("FAIL: embed.weight shape mismatch\n");
-            return;
-        }
-        printf("OK: decoder.prediction.embed.weight [1025, 640]\n");
-    }
+    // Test encoder output (no final norm/fc in this model, uses joint.enc instead)
 
-    // Test LSTM weights
-    {
-        const auto& t = weights.require("decoder.prediction.dec_rnn.lstm.weight_ih_l0");
-        if (t.shape.size() != 2 || t.shape[0] != 2560 || t.shape[1] != 640) {
-            printf("FAIL: lstm.weight_ih_l0 shape mismatch\n");
-            return;
-        }
-        printf("OK: lstm.weight_ih_l0 [2560, 640]\n");
-    }
+    // Test decoder
+    test_tensor("decoder.prediction.embed.weight");
+    test_tensor("decoder.prediction.dec_rnn.lstm.weight_ih_l0");
+    test_tensor("decoder.prediction.fc.weight");
 
-    // Test joint network
-    {
-        const auto& t = weights.require("joint.joint_net.2.weight");
-        if (t.shape.size() != 2 || t.shape[0] != 1025 || t.shape[1] != 640) {
-            printf("FAIL: joint_net.2.weight shape mismatch\n");
-            return;
-        }
-        printf("OK: joint.joint_net.2.weight [1025, 640]\n");
-    }
+    // Test joint
+    test_tensor("joint.enc.weight");
+    test_tensor("joint.pred.weight");
+    test_tensor("joint.joint_net.2.weight");
+    test_tensor("joint.joint_net.2.bias");
 
-    printf("\nAll shape tests passed!\n");
-}
+    printf("\n=== Summary ===\n");
+    printf("Passed: %d\n", passed);
+    printf("Failed: %d\n", failed);
 
-void test_tensor_values(const ModelWeights& weights) {
-    printf("\n=== Testing tensor values (spot check) ===\n");
+    nemo_free(ctx);
 
-    // Check that values are in reasonable range
-    const auto& t = weights.require("encoder.layers.0.norm_feed_forward1.weight");
-    float min_val = t.data[0], max_val = t.data[0], sum = 0;
-    for (size_t i = 0; i < t.numel(); i++) {
-        min_val = std::min(min_val, t.data[i]);
-        max_val = std::max(max_val, t.data[i]);
-        sum += t.data[i];
-    }
-    float mean = sum / t.numel();
-
-    printf("norm_feed_forward1.weight: min=%.4f, max=%.4f, mean=%.4f\n",
-           min_val, max_val, mean);
-
-    // LayerNorm weight should be close to 1.0
-    if (std::abs(mean - 1.0f) > 0.1f) {
-        printf("WARNING: LayerNorm weight mean far from 1.0\n");
-    }
-
-    // Check attention weights
-    const auto& q = weights.require("encoder.layers.0.self_attn.linear_q.weight");
-    float q_sum = 0, q_sum_sq = 0;
-    for (size_t i = 0; i < q.numel(); i++) {
-        q_sum += q.data[i];
-        q_sum_sq += q.data[i] * q.data[i];
-    }
-    float q_mean = q_sum / q.numel();
-    float q_std = std::sqrt(q_sum_sq / q.numel() - q_mean * q_mean);
-    printf("linear_q.weight: mean=%.6f, std=%.6f\n", q_mean, q_std);
-
-    // Should be roughly Xavier initialized
-    float expected_std = std::sqrt(2.0f / (1024 + 1024));
-    if (std::abs(q_std - expected_std) > 0.01f) {
-        printf("Note: std differs from Xavier init (%.4f)\n", expected_std);
-    }
-
-    printf("\nValue spot checks complete!\n");
-}
-
-void test_all_layers(const ModelWeights& weights) {
-    printf("\n=== Verifying all 24 layers exist ===\n");
-
-    for (int i = 0; i < 24; i++) {
-        std::string prefix = "encoder.layers." + std::to_string(i);
-
-        // Check each layer has all required weights
-        const char* required[] = {
-            ".norm_feed_forward1.weight",
-            ".norm_feed_forward1.bias",
-            ".feed_forward1.linear1.weight",
-            ".feed_forward1.linear2.weight",
-            ".norm_conv.weight",
-            ".norm_conv.bias",
-            ".conv.pointwise_conv1.weight",
-            ".conv.depthwise_conv.weight",
-            ".conv.batch_norm.weight",
-            ".conv.batch_norm.bias",
-            ".conv.pointwise_conv2.weight",
-            ".norm_self_att.weight",
-            ".norm_self_att.bias",
-            ".self_attn.pos_bias_u",
-            ".self_attn.pos_bias_v",
-            ".self_attn.linear_q.weight",
-            ".self_attn.linear_k.weight",
-            ".self_attn.linear_v.weight",
-            ".self_attn.linear_out.weight",
-            ".self_attn.linear_pos.weight",
-            ".norm_feed_forward2.weight",
-            ".norm_feed_forward2.bias",
-            ".feed_forward2.linear1.weight",
-            ".feed_forward2.linear2.weight",
-            ".norm_out.weight",
-            ".norm_out.bias",
-        };
-
-        for (const char* suffix : required) {
-            std::string name = prefix + suffix;
-            if (!weights.has(name)) {
-                printf("FAIL: Missing tensor %s\n", name.c_str());
-                return;
-            }
-        }
-    }
-
-    printf("OK: All 24 layers have complete weights (26 tensors each)\n");
-}
-
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        printf("Usage: %s <weights.bin>\n", argv[0]);
-        return 1;
-    }
-
-    ModelWeights weights;
-    if (!weights.load(argv[1])) {
-        printf("Failed to load weights\n");
-        return 1;
-    }
-
-    printf("\n=== Weight Loading Test ===\n");
-    printf("Total tensors: %zu\n", weights.size());
-    printf("Total parameters: %zu\n", weights.total_params());
-
-    test_tensor_shapes(weights);
-    test_tensor_values(weights);
-    test_all_layers(weights);
-
-    printf("\n=== All tests passed! ===\n");
-    return 0;
+    return failed > 0 ? 1 : 0;
 }

@@ -27,11 +27,11 @@ ifeq ($(CUDA_AVAILABLE),1)
 endif
 
 # Source files
-GGML_SRCS = src-ggml/nemo-ggml.cpp src-ggml/preprocessor.cpp
-GGML_STREAM_SRCS = src-ggml/nemo-stream.cpp
+GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
+GGML_STREAM_SRCS = src/nemo-stream.cpp
 
 # Original implementation (for comparison tests)
-ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp src/rnnt_decoder.cpp src/rnnt_joint.cpp src/greedy_decode.cpp src/tokenizer.cpp
+ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/conv_subsampling.cpp src/reference/conformer_modules.cpp src/reference/conformer_encoder.cpp src/reference/rnnt_decoder.cpp src/reference/rnnt_joint.cpp src/reference/greedy_decode.cpp src/reference/tokenizer.cpp
 
 .PHONY: all clean test transcribe streaming
 
@@ -40,11 +40,11 @@ all: test_ggml_weights test_ggml_compute transcribe streaming
 streaming: test_streaming transcribe_stream
 
 # Test weight loading
-test_ggml_weights: tests-ggml/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
+test_ggml_weights: tests/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Test computation
-test_ggml_compute: tests-ggml/test_compute.cpp $(GGML_SRCS) $(ORIG_SRCS)
+test_ggml_compute: tests/test_compute.cpp $(GGML_SRCS) $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Precompute encoder reference output (run once, saves ~2 min per test run)
@@ -52,23 +52,23 @@ precompute_encoder_ref: scripts/precompute_encoder_ref.cpp $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ -I include -o $@
 
 # Transcribe example
-transcribe: src-ggml/transcribe.cpp $(GGML_SRCS)
+transcribe: src/transcribe.cpp $(GGML_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Streaming test
-test_streaming: tests-ggml/test_streaming.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+test_streaming: tests/test_streaming.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Python reference comparison test
-test_python_ref: tests-ggml/test_python_reference.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+test_python_ref: tests/test_python_reference.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Preprocessor test
-test_preprocessor: tests-ggml/test_preprocessor.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+test_preprocessor: tests/test_preprocessor.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Streaming transcribe example
-transcribe_stream: src-ggml/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+transcribe_stream: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:

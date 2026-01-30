@@ -12,3 +12,6 @@ dump_*
 # Editor files
 *.swp
 *~
+/data/*
+/weights/*
+/streaming_ref/*
