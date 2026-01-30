@@ -911,8 +911,8 @@ void append_dump_array(
     for (int i = 0; i < 4; i++) {
         if (info.shape[i] != ne[i]) {
             fprintf(stderr, "[ERROR] Shape mismatch for dump file: %s\n", filename);
-            fprintf(stderr, "Expected shape: [%ld, %ld, %ld, %ld]\n", info.shape[0], info.shape[1], info.shape[2], info.shape[3]);
-            fprintf(stderr, "Actual shape:   [%ld, %ld, %ld, %ld]\n", ne[0], ne[1], ne[2], ne[3]);
+            fprintf(stderr, "Expected shape: [%lld, %lld, %lld, %lld]\n", info.shape[0], info.shape[1], info.shape[2], info.shape[3]);
+            fprintf(stderr, "Actual shape:   [%lld, %lld, %lld, %lld]\n", ne[0], ne[1], ne[2], ne[3]);
             return;
         }
     }
@@ -947,7 +947,7 @@ void append_dump_tensor(
         printf("Dumping tensor '%s' to %s, shape: ", name, filename);
         const char * sep = "";
         for (size_t i = 0; i < ndim; i++) {
-            printf("%s%ld", sep, tensor->ne[i]);
+            printf("%s%lld", sep, tensor->ne[i]);
             sep = ", ";
             size_t dim_size = tensor->ne[i];
             (void)dim_size;

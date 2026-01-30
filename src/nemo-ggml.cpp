@@ -1,6 +1,7 @@
 #include "nemo-ggml.h"
 #include "preprocessor.h"
 
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -33,6 +34,16 @@ static void compute_pos_emb(float * data, int max_len, int d_model) {
 static bool init_backend(nemo_model & model, nemo_backend_type backend_type) {
     model.backend = nullptr;
     model.backend_type = NEMO_BACKEND_CPU;  // default
+
+#ifdef GGML_USE_METAL
+    if (backend_type == NEMO_BACKEND_METAL || backend_type == NEMO_BACKEND_AUTO) {
+        model.backend = ggml_backend_metal_init();
+        if (!model.backend) {
+            fprintf(stderr, "Failed to initialize Metal backend\n");
+            assert(false);
+        }
+    }
+#endif
 
 #ifdef GGML_USE_CUDA
     if (backend_type == NEMO_BACKEND_CUDA || backend_type == NEMO_BACKEND_AUTO) {

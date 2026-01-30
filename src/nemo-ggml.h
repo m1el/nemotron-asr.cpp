@@ -7,6 +7,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -22,7 +26,8 @@ struct timed_token;
 enum nemo_backend_type {
     NEMO_BACKEND_CPU = 0,
     NEMO_BACKEND_CUDA = 1,
-    NEMO_BACKEND_AUTO = 2,  // Auto-detect: prefer CUDA if available
+    NEMO_BACKEND_METAL = 2,
+    NEMO_BACKEND_AUTO = 3,  // Auto-detect: prefer CUDA if available
 };
 
 // Forward declaration

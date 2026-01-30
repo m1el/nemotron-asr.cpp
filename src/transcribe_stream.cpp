@@ -33,6 +33,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  right_context   - Attention right context (0, 1, 6, or 13, default: 0)\n");
     fprintf(stderr, "  --cpu           - Force CPU backend\n");
     fprintf(stderr, "  --cuda          - Force CUDA backend\n");
+    fprintf(stderr, "  --metal         - Force Metal backend\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Streaming modes:\n");
     fprintf(stderr, "  right_context=0  - Pure causal, 80ms latency\n");
@@ -45,6 +46,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0 --cuda\n", prog);
     fprintf(stderr, "  ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - | %s weights/model.gguf -\n", prog);
     fprintf(stderr, "  arecord -f S16_LE -r 16000 -c 1 - | %s weights/model.gguf - 80 0 --cuda\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0 --metal\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -66,6 +68,8 @@ int main(int argc, char ** argv) {
             backend = NEMO_BACKEND_CPU;
         } else if (strcmp(argv[i], "--cuda") == 0) {
             backend = NEMO_BACKEND_CUDA;
+        } else if (strcmp(argv[i], "--metal") == 0) {
+            backend = NEMO_BACKEND_METAL;
         } else if (i == 3) {
             chunk_ms = atoi(argv[i]);
             if (chunk_ms < 10) {
