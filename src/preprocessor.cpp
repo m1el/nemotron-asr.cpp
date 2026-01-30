@@ -61,44 +61,102 @@ struct nemo_preprocessor {
     Tensor filterbank;
     std::vector<float> sin_vals;
     std::vector<float> cos_vals;
+    std::vector<size_t> bit_rev;  // Precomputed bit-reversal permutation
 
     // Work buffers
     std::vector<float> frame;
     std::vector<float> real_out;
     std::vector<float> imag_out;
+    std::vector<float> fft_real;  // FFT working buffer
+    std::vector<float> fft_imag;  // FFT working buffer
     std::vector<std::vector<float>> spectrogram;
     std::vector<float> audio_buf;
 };
 
 // ============================================================================
-// DFT computation
+// FFT computation (Cooley-Tukey radix-2 decimation-in-time)
 // ============================================================================
 
 static void fill_sin_cos_table(nemo_preprocessor * pp) {
-    pp->sin_vals.resize(pp->n_fft);
-    pp->cos_vals.resize(pp->n_fft);
-    for (size_t i = 0; i < pp->n_fft; i++) {
-        float theta = (2.0f * (float)M_PI * i) / pp->n_fft;
+    size_t n = pp->n_fft;
+
+    // Precompute twiddle factors for FFT
+    pp->sin_vals.resize(n);
+    pp->cos_vals.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        float theta = (2.0f * (float)M_PI * i) / n;
         pp->sin_vals[i] = sinf(theta);
         pp->cos_vals[i] = cosf(theta);
     }
+
+    // Precompute bit-reversal permutation
+    int log2n = 0;
+    for (size_t temp = n; temp > 1; temp >>= 1) log2n++;
+
+    pp->bit_rev.resize(n);
+    for (size_t i = 0; i < n; i++) {
+        size_t result = 0;
+        size_t x = i;
+        for (int j = 0; j < log2n; j++) {
+            result = (result << 1) | (x & 1);
+            x >>= 1;
+        }
+        pp->bit_rev[i] = result;
+    }
+
+    // Allocate FFT working buffers
+    pp->fft_real.resize(n);
+    pp->fft_imag.resize(n);
 }
 
-static void dft_frame(nemo_preprocessor * pp, const float * frame) {
-    size_t n_fft = pp->n_fft;
-    size_t n_bins = 1 + n_fft / 2;
+// In-place radix-2 FFT (Cooley-Tukey decimation-in-time)
+static void fft_frame(nemo_preprocessor * pp, const float * frame) {
+    size_t n = pp->n_fft;
+    size_t n_bins = 1 + n / 2;
 
-    for (size_t k = 0; k < n_bins; k++) {
-        float real_sum = 0.0f;
-        float imag_sum = 0.0f;
-        for (size_t n = 0; n < n_fft; n++) {
-            float sample = frame[n];
-            size_t idx = (k * n) % n_fft;
-            real_sum += sample * pp->cos_vals[idx];
-            imag_sum -= sample * pp->sin_vals[idx];
+    float * __restrict real = pp->fft_real.data();
+    float * __restrict imag = pp->fft_imag.data();
+    const size_t * __restrict bit_rev = pp->bit_rev.data();
+    const float * __restrict cos_tbl = pp->cos_vals.data();
+    const float * __restrict sin_tbl = pp->sin_vals.data();
+
+    // Copy input with bit-reversal permutation
+    for (size_t i = 0; i < n; i++) {
+        real[bit_rev[i]] = frame[i];
+        imag[bit_rev[i]] = 0.0f;
+    }
+
+    // FFT butterfly computation
+    // log2(512) = 9 stages
+    for (size_t m = 2; m <= n; m <<= 1) {
+        size_t m2 = m >> 1;         // Half block size
+        size_t step = n / m;        // Twiddle factor step
+
+        for (size_t k = 0; k < n; k += m) {
+            for (size_t j = 0; j < m2; j++) {
+                size_t idx = j * step;
+                float wr = cos_tbl[idx];
+                float wi = -sin_tbl[idx];  // -sin for forward FFT
+
+                size_t i1 = k + j;
+                size_t i2 = k + j + m2;
+
+                // Butterfly: (a, b) -> (a + W*b, a - W*b)
+                float tr = wr * real[i2] - wi * imag[i2];
+                float ti = wr * imag[i2] + wi * real[i2];
+
+                real[i2] = real[i1] - tr;
+                imag[i2] = imag[i1] - ti;
+                real[i1] = real[i1] + tr;
+                imag[i1] = imag[i1] + ti;
+            }
         }
-        pp->real_out[k] = real_sum;
-        pp->imag_out[k] = imag_sum;
+    }
+
+    // Copy result to output buffers (only positive frequencies)
+    for (size_t i = 0; i < n_bins; i++) {
+        pp->real_out[i] = real[i];
+        pp->imag_out[i] = imag[i];
     }
 }
 
@@ -135,8 +193,8 @@ static void stft_magnitude(nemo_preprocessor * pp, const float * audio, size_t a
             pp->frame[i] = sample;
         }
 
-        // Compute DFT
-        dft_frame(pp, pp->frame.data());
+        // Compute FFT
+        fft_frame(pp, pp->frame.data());
 
         // Compute magnitude
         for (size_t k = 0; k < n_bins; k++) {
