@@ -4,7 +4,7 @@ GGML_DIR = /var/data/nvidia-speech/ggml
 GGML_BUILD = $(GGML_DIR)/build
 
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS = -g -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I $(GGML_DIR)/include
 CXXFLAGS += -I include
 

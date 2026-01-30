@@ -184,6 +184,9 @@ int main(int argc, char ** argv) {
     printf("  Processing time:     %.2f sec\n", processing_time_sec);
     printf("  Real-time factor:    %.3fx\n", processing_time_sec / total_duration_sec);
 
+    // Print detailed profiling stats
+    nemo_stream_finalize(sctx);
+
     // Cleanup
     nemo_stream_free(sctx);
     nemo_free(ctx);

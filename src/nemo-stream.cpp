@@ -71,6 +71,10 @@ void nemo_stream_context::init(struct nemo_context* ctx, const nemo_cache_config
     // Reset timing
     total_audio_seconds = 0;
     total_compute_seconds = 0;
+    encoder_seconds = 0;
+    decoder_seconds = 0;
+    transfer_seconds = 0;
+    total_decode_iterations = 0;
 }
 
 void nemo_stream_context::reset() {
@@ -86,6 +90,10 @@ void nemo_stream_context::reset() {
     transcript.clear();
     total_audio_seconds = 0;
     total_compute_seconds = 0;
+    encoder_seconds = 0;
+    decoder_seconds = 0;
+    transfer_seconds = 0;
+    total_decode_iterations = 0;
     cache_valid_len = 0;
     total_chunks_processed = 0;
     // Don't reset decode_graph - it can be reused
@@ -269,7 +277,7 @@ void nemo_encoder_graph::init(struct nemo_context* nctx, const nemo_cache_config
         ggml_backend_tensor_set(conv_cache_ins[l], zeros_conv.data(), 0, zeros_conv.size() * sizeof(float));
     }
     // Sync to ensure initialization completes before compute
-    ggml_backend_synchronize(nctx->model.backend);
+    // ggml_backend_synchronize(nctx->model.backend);
 
     initialized = true;
 }
@@ -786,7 +794,11 @@ static std::vector<int> decode_one_step(
     std::vector<float> new_c_state(sctx->decoder_state.c.size());
 
     for (int sym = 0; sym < MAX_SYMBOLS_PER_STEP; sym++) {
-        // Set inputs
+        sctx->total_decode_iterations++;
+
+        // Set inputs (measure transfer time)
+        auto t_transfer_start = std::chrono::high_resolution_clock::now();
+
         ggml_backend_tensor_set(sctx->decode_h_in, sctx->decoder_state.h.data(), 0,
                                  sctx->decoder_state.h.size() * sizeof(float));
         ggml_backend_tensor_set(sctx->decode_c_in, sctx->decoder_state.c.data(), 0,
@@ -800,11 +812,20 @@ static std::vector<int> decode_one_step(
 
         ggml_backend_tensor_set(sctx->decode_enc_in, enc_frame, 0, d_model * sizeof(float));
 
-        // Compute
-        ggml_backend_graph_compute(nctx->model.backend, sctx->decode_graph);
+        auto t_transfer_end = std::chrono::high_resolution_clock::now();
+        sctx->transfer_seconds += std::chrono::duration<double>(t_transfer_end - t_transfer_start).count();
 
-        // Get logits and find argmax
+        // Compute (measure decoder time)
+        auto t_decode_start = std::chrono::high_resolution_clock::now();
+        ggml_backend_graph_compute(nctx->model.backend, sctx->decode_graph);
+        auto t_decode_end = std::chrono::high_resolution_clock::now();
+        sctx->decoder_seconds += std::chrono::duration<double>(t_decode_end - t_decode_start).count();
+
+        // Get logits and find argmax (measure transfer time)
+        auto t_transfer2_start = std::chrono::high_resolution_clock::now();
         ggml_backend_tensor_get(sctx->decode_logits, logits_data.data(), 0, vocab_size * sizeof(float));
+        auto t_transfer2_end = std::chrono::high_resolution_clock::now();
+        sctx->transfer_seconds += std::chrono::duration<double>(t_transfer2_end - t_transfer2_start).count();
 
         int best_token = 0;
         float best_score = logits_data[0];
@@ -820,9 +841,12 @@ static std::vector<int> decode_one_step(
             break;
         }
 
-        // Get updated state
+        // Get updated state (measure transfer time)
+        auto t_transfer3_start = std::chrono::high_resolution_clock::now();
         ggml_backend_tensor_get(sctx->decode_h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
         ggml_backend_tensor_get(sctx->decode_c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
+        auto t_transfer3_end = std::chrono::high_resolution_clock::now();
+        sctx->transfer_seconds += std::chrono::duration<double>(t_transfer3_end - t_transfer3_start).count();
 
         // Emit non-blank token
         emitted_tokens.push_back(best_token);
@@ -950,9 +974,12 @@ static std::string process_mel_chunk_streaming(
     ggml_backend_tensor_set(sctx->encoder_graph.attn_mask, mask_data.data(), 0,
                             kv_len * sizeof(float));
 
-    // Run encoder graph
+    // Run encoder graph (measure encoder time)
+    auto t_encoder_start = std::chrono::high_resolution_clock::now();
     ggml_backend_graph_compute(nctx->model.backend, sctx->encoder_graph.graph);
-    ggml_backend_synchronize(nctx->model.backend);
+    // ggml_backend_synchronize(nctx->model.backend);
+    auto t_encoder_end = std::chrono::high_resolution_clock::now();
+    sctx->encoder_seconds += std::chrono::duration<double>(t_encoder_end - t_encoder_start).count();
 
     // Get encoder output
     size_t enc_out_frames = sctx->encoder_graph.encoder_out->ne[1];
@@ -965,9 +992,9 @@ static std::string process_mel_chunk_streaming(
     // append_dump_tensor(sctx->encoder_graph.ctx, "encoder_out", "my_bin/ggml_subsampling_output.bin");
     // torch.Size([1, 1, 1024])
     assert((size_t)subsampled->ne[0] == d_model);
-    assert((size_t)subsampled->ne[1] == 1);
+    // assert((size_t)subsampled->ne[1] == 1); TODO: depends on chunk size
     assert((size_t)subsampled->ne[2] == 1);
-    ggml_backend_synchronize(nctx->model.backend);
+    // ggml_backend_synchronize(nctx->model.backend);
 
     // Update cache validity tracking
     // cache_valid_len grows by enc_out_frames (chunk_len), capped at cache_len
@@ -1098,7 +1125,23 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
     printf("[STREAMING STATS] Total audio: %.2f seconds\n", sctx->total_audio_seconds);
     printf("[STREAMING STATS] Total compute: %.4f seconds\n", sctx->total_compute_seconds);
     printf("[STREAMING STATS] RTF (compute/audio): %.4f\n", sctx->rtf());
-    printf("[STREAMING STATS] Config: chunk_mel_frames=%zu, shift_mel_frames=%zu, valid_out_len=%d\n",
+
+    // Detailed timing breakdown
+    printf("\n[PROFILING] Timing breakdown:\n");
+    printf("[PROFILING]   Encoder compute:    %.4f sec (%.1f%%)\n",
+           sctx->encoder_seconds, 100.0 * sctx->encoder_seconds / sctx->total_compute_seconds);
+    printf("[PROFILING]   Decoder compute:    %.4f sec (%.1f%%)\n",
+           sctx->decoder_seconds, 100.0 * sctx->decoder_seconds / sctx->total_compute_seconds);
+    printf("[PROFILING]   CPU-GPU transfers:  %.4f sec (%.1f%%)\n",
+           sctx->transfer_seconds, 100.0 * sctx->transfer_seconds / sctx->total_compute_seconds);
+    double other_seconds = sctx->total_compute_seconds - sctx->encoder_seconds - sctx->decoder_seconds - sctx->transfer_seconds;
+    printf("[PROFILING]   Other (CPU work):   %.4f sec (%.1f%%)\n",
+           other_seconds, 100.0 * other_seconds / sctx->total_compute_seconds);
+    printf("[PROFILING]   Decode iterations:  %d (avg %.1f per chunk)\n",
+           sctx->total_decode_iterations,
+           (double)sctx->total_decode_iterations / sctx->total_chunks_processed);
+
+    printf("\n[STREAMING STATS] Config: chunk_mel_frames=%zu, shift_mel_frames=%zu, valid_out_len=%d\n",
            sctx->config.get_chunk_mel_frames(),
            sctx->config.get_shift_mel_frames(),
            sctx->config.valid_out_len);

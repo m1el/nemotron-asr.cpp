@@ -219,6 +219,12 @@ struct nemo_stream_context {
     double total_audio_seconds;
     double total_compute_seconds;
 
+    // Detailed timing breakdown (for profiling)
+    double encoder_seconds;
+    double decoder_seconds;
+    double transfer_seconds;
+    int total_decode_iterations;  // Total decoder loop iterations
+
     // Cache validity tracking (for attention masking)
     // Starts at 0, grows by chunk_len each chunk, capped at cache_len
     int cache_valid_len;
