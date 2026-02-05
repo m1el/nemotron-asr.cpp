@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone ggml
+        run: git clone --depth 1 https://github.com/ggml-org/ggml.git
+
+      - name: Build ggml
+        run: |
+          mkdir ggml/build
+          cd ggml/build
+          cmake ..
+          make -j$(nproc)
+
+      - name: Build nemotron-asr.cpp
+        run: make nemotron-asr.cpp
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nemotron-asr-linux
+          path: nemotron-asr.cpp
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone ggml
+        run: git clone --depth 1 https://github.com/ggml-org/ggml.git
+
+      - name: Build ggml
+        run: |
+          mkdir ggml/build
+          cd ggml/build
+          cmake ..
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Build nemotron-asr.cpp
+        run: make nemotron-asr.cpp
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nemotron-asr-macos
+          path: nemotron-asr.cpp
