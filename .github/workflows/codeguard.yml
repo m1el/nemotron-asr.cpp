@@ -1,0 +1,36 @@
+name: CodeGuard
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codeguard:
+    runs-on: ubuntu-latest
+    environment: codeguard-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CodeGuard analysis
+        uses: DNYoussef/codeguard-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          risk_threshold: L3
+          rubric: default
+          post_comment: "true"
+          generate_bundle: "true"
+          fail_on_high_risk: "true"
+          ai_review: "true"
+          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeguard-evidence-bundle
+          path: .guardspine/
+          retention-days: 90
