@@ -1,0 +1,245 @@
+# Clarity Linter Rubric
+# Based on cognitive load theory and code readability research
+#
+# Cognitive Load Types (Sweller, 1988):
+# - Intrinsic: Inherent complexity of the problem
+# - Extraneous: Unnecessary complexity from poor presentation
+# - Germane: Complexity that aids learning/understanding
+#
+# Goal: Minimize extraneous cognitive load
+
+name: clarity
+version: "1.0"
+description: "Clarity analysis measuring cognitive load and readability"
+
+thresholds:
+  max_cognitive_complexity: 15
+  max_nesting_depth: 4
+  max_parameters: 5
+  max_line_length: 100
+  max_file_lines: 500
+
+rules:
+  # Naming Clarity
+  - id: CLR-001
+    name: descriptive_names
+    category: naming
+    severity: medium
+    description: "Variable and function names should be self-documenting"
+    guidance: |
+      Names should reveal intent:
+      - Use full words, not abbreviations
+      - Avoid single-letter names (except i,j,k in loops)
+      - Name length proportional to scope
+      - Boolean names should be questions (is_valid, has_items)
+    patterns:
+      - "def\\s+[a-z]\\("
+      - "function\\s+[a-z]\\("
+      - "(?:const|let|var)\\s+[a-z]\\s*="
+
+  - id: CLR-002
+    name: consistent_naming_convention
+    category: naming
+    severity: low
+    description: "Use consistent naming conventions throughout"
+    guidance: |
+      Follow language conventions:
+      - Python: snake_case for functions/variables, PascalCase for classes
+      - Constants: UPPER_SNAKE_CASE
+      - Private: _leading_underscore
+    patterns:
+      - "^class\\s+[a-zA-Z]+_[a-zA-Z_]+\\s*[:(]"
+      - "^(?:export\\s+)?class\\s+[a-zA-Z]+_[a-zA-Z_]+\\s*[{(]"
+
+  # Structural Clarity
+  - id: CLR-003
+    name: deep_nesting
+    category: structure
+    severity: high
+    description: "Avoid deeply nested code blocks"
+    guidance: |
+      Deep nesting increases cognitive load:
+      - Maximum 4 levels of nesting
+      - Use early returns (guard clauses)
+      - Extract nested logic to functions
+      - Consider State pattern for complex conditions
+    max_nesting_depth: 4
+    patterns:
+      - "^\\s{12,}if\\s*\\("
+      - "^\\s{12,}for\\s*\\("
+      - "^\\s{12,}while\\s*\\("
+      - "^\\s{24,}if"
+      - "^\\s{24,}for"
+      - "^\\s{24,}while"
+
+  - id: CLR-004
+    name: long_functions
+    category: structure
+    severity: medium
+    description: "Functions should fit in one mental chunk"
+    guidance: |
+      Keep functions short:
+      - Maximum 30-40 lines ideal
+      - One level of abstraction
+      - Single responsibility
+      - Easy to hold in working memory
+    max_function_lines: 40
+
+  - id: CLR-005
+    name: parameter_overload
+    category: structure
+    severity: high
+    description: "Too many parameters indicate need for refactoring"
+    guidance: |
+      Limit function parameters:
+      - Maximum 5 parameters
+      - Use parameter objects for related data
+      - Consider builder pattern
+      - Named parameters for clarity
+    max_parameters: 5
+    patterns:
+      - "def\\s+[a-z_]+\\([^)]{400,}\\)"
+      - "function\\s+\\w+\\([^)]{200,}\\)"
+      - "\\w+\\s*\\([^)]{200,}\\)\\s*[:{=>]"
+
+  # Logical Clarity
+  - id: CLR-006
+    name: complex_conditionals
+    category: logic
+    severity: high
+    description: "Complex boolean expressions are hard to reason about"
+    guidance: |
+      Simplify conditionals:
+      - Maximum 3 conditions per expression
+      - Extract to named boolean variables
+      - Use De Morgan's laws to simplify
+      - Consider truth tables for complex logic
+    patterns:
+      - "if.*and.*and.*and"
+      - "if.*or.*or.*or"
+      - "if.*and.*or.*and"
+      - "if\\s*\\(.*&&.*&&.*&&"
+      - "if\\s*\\(.*\\|\\|.*\\|\\|.*\\|\\|"
+      - "if\\s*\\(.*&&.*\\|\\|.*&&"
+
+  - id: CLR-007
+    name: negation_chains
+    category: logic
+    severity: medium
+    description: "Chains of negations are confusing"
+    guidance: |
+      Avoid double/triple negatives:
+      - not not x -> x
+      - not is_invalid -> is_valid
+      - Prefer positive conditions
+    patterns:
+      - "^[^#\"']*\\bnot\\s+not\\b"
+      - "^[^#\"']*!\\s*!"
+
+  - id: CLR-008
+    name: implicit_type_coercion
+    category: logic
+    severity: medium
+    description: "Implicit type coercion obscures intent"
+    guidance: |
+      Be explicit about types:
+      - if x: -> if x is not None:
+      - if len(x): -> if len(x) > 0:
+      - Document expected types
+    patterns:
+      - "if\\s+not\\s+not\\s+"
+
+  # Documentation Clarity
+  - id: CLR-009
+    name: missing_docstrings
+    category: documentation
+    severity: low
+    description: "Public functions should have docstrings"
+    guidance: |
+      Document public interfaces:
+      - What the function does
+      - Parameters and types
+      - Return value and type
+      - Exceptions raised
+    patterns:
+      - "^def\\s+[a-z][a-z_]{15,}\\([^)]*\\)\\s*:"
+      - "^(?:export\\s+)?(?:async\\s+)?function\\s+[a-z][a-zA-Z]{15,}\\("
+      - "^(?:export\\s+)?(?:const|let)\\s+[a-z][a-zA-Z]{15,}\\s*="
+
+  - id: CLR-010
+    name: comment_code_mismatch
+    category: documentation
+    severity: high
+    description: "Comments that contradict code are worse than no comments"
+    guidance: |
+      Keep comments synchronized:
+      - Update comments when code changes
+      - Prefer self-documenting code
+      - Comments explain why, not what
+      - Delete obsolete comments
+
+  # Cognitive Load Metrics
+  - id: CLR-011
+    name: cyclomatic_complexity
+    category: metrics
+    severity: high
+    description: "High cyclomatic complexity indicates hard-to-test code"
+    guidance: |
+      Reduce decision points:
+      - Maximum complexity of 10-15
+      - Each if/for/while/except adds 1
+      - Extract complex branches to functions
+    max_cyclomatic_complexity: 15
+
+  - id: CLR-012
+    name: cognitive_complexity
+    category: metrics
+    severity: high
+    description: "Cognitive complexity measures code understandability"
+    guidance: |
+      Cognitive complexity accounts for:
+      - Nesting depth (exponential penalty)
+      - Break in linear flow
+      - Logical operators
+      - Recursion
+    max_cognitive_complexity: 15
+
+  - id: CLR-013
+    name: halstead_difficulty
+    category: metrics
+    severity: medium
+    description: "Halstead difficulty measures programming effort"
+    guidance: |
+      Reduce vocabulary and length:
+      - Fewer unique operators
+      - Fewer unique operands
+      - Shorter implementations
+    max_halstead_difficulty: 30
+
+  # Formatting Clarity
+  - id: CLR-014
+    name: inconsistent_formatting
+    category: formatting
+    severity: low
+    description: "Inconsistent formatting disrupts reading flow"
+    guidance: |
+      Use consistent formatting:
+      - Configure auto-formatter (black, prettier)
+      - Consistent indentation
+      - Consistent spacing around operators
+    patterns:
+      - "^[^#]*\\w\\s{4,}=\\s"
+      - "^[^#]*=\\s{4,}\\w"
+
+  - id: CLR-015
+    name: long_lines
+    category: formatting
+    severity: low
+    description: "Long lines require horizontal scrolling"
+    guidance: |
+      Keep lines short:
+      - Maximum 100 characters
+      - Break at logical points
+      - Use line continuation for clarity
+    max_line_length: 100
+

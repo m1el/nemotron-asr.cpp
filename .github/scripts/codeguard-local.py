@@ -293,7 +293,7 @@ def main():
     analysis = analyzer.analyze(diff_content, rubric=args.rubric)
 
     # ---- Classify risk ----
-    classifier = RiskClassifier(rubric=args.rubric)
+    classifier = RiskClassifier(rubric=args.rubric, repo_root=repo_root)
     risk_result = classifier.classify(analysis)
 
     # ---- Build evidence bundle ----

@@ -93,7 +93,8 @@ def main():
     print(f"Lines added: {analysis['lines_added']}")
     print(f"Lines removed: {analysis['lines_removed']}")
 
-    classifier = RiskClassifier(rubric=rubric)
+    repo_root = Path(os.environ.get("GITHUB_WORKSPACE", "/workspace"))
+    classifier = RiskClassifier(rubric=rubric, repo_root=repo_root)
     risk_result = classifier.classify(analysis)
     risk_tier = risk_result["risk_tier"]
     print(f"Risk tier: {risk_tier}")
