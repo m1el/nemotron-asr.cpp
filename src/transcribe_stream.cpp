@@ -24,6 +24,7 @@
 #endif
 
 static void print_usage(const char * prog) {
+    fprintf(stderr, "this is a change that is not that important but it is a change\n");
     fprintf(stderr, "Usage: %s <model.gguf> <audio.pcm|-|--stdin> [chunk_ms] [right_context] [--cpu|--cuda]\n", prog);
     fprintf(stderr, "\n");
     fprintf(stderr, "  model.gguf      - GGUF model file\n");

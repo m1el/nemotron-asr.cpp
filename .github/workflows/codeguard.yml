@@ -18,21 +18,32 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run CodeGuard analysis
-        uses: DNYoussef/codeguard-action@main
+        id: codeguard
+        # WIP: the codeguard-action is still in development, so the repo URL might change.
+        # We're using the main branch for now, will be tagged correctly when we release a version.
+        uses: DNyoussef/codeguard-action@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           risk_threshold: L3
-          rubric: default
+          # Optional: specify a rubric to use for analysis.
+          # Either use pre-existing rubrics (e.g., "clarity")
+          # or a custom rubric defined in the repository.
+          rubric: .codeguard/rubrics/clarity-mine.yaml
           post_comment: "true"
           generate_bundle: "true"
           fail_on_high_risk: "true"
+          # Optional: enable AI review for high-risk findings.
+          # This will add an AI-generated review comment to the PR with suggestions for how to address the issue.
           ai_review: "true"
+          # OpenRouter API key for AI review. It's possible to use a local model,
+          # but for the easiest reproduction, we'll use OpenRouter
           openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
 
+      # Optional: upload the evidence bundle as an artifact for later inspection
       - name: Upload evidence bundle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: codeguard-evidence-bundle
-          path: .guardspine/
+          path: .guardspine/bundles/
           retention-days: 90
