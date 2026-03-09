@@ -20,6 +20,14 @@ thresholds:
   max_file_lines: 500
 
 rules:
+  - id: FOOBAR
+    name: foobar_rule
+    category: test
+    severity: low
+    description: "This is a test rule for demonstration purposes"
+    guidance: "FOOBAR should not appear inthe codebase"
+    patterns: 
+      - "FOOBAR"
   # Naming Clarity
   - id: CLR-001
     name: descriptive_names
