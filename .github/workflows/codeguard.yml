@@ -21,6 +21,7 @@ jobs:
           risk_threshold: L3
           rubric: .codeguard/rubrics/clarity-mine.yaml
           openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          openrouter_model: anthropic/claude-opus-4.6
           ai_review: "true"
           github_token: ${{ github.token }}
           guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
