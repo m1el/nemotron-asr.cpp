@@ -10,7 +10,7 @@
 // Maximum nodes in computation graph
 #define NEMO_MAX_NODES 8192
 
-// FOOBAR
+static void FOOBAR() {}
 
 // Compute positional embeddings (sinusoidal)
 // NeMo convention: pos[0] = most positive position, pos[total_len-1] = most negative
