@@ -1,0 +1,17 @@
+# GuardSpine CodeGuard Configuration
+# Generated during onboarding
+
+api_url: https://backend-production-0f5d.up.railway.app/api/v1
+project_id: proj-6f3ab4e6183d
+
+rubric_packs:
+  - security-baseline
+  - pii-shield
+
+evidence:
+  upload: true
+  format: json
+  sign: true
+
+notifications:
+  slack_channel: 

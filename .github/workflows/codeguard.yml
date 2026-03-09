@@ -1,10 +1,7 @@
-name: CodeGuard
-
+name: CodeGuard Governance
 on:
-  push:
-    branches: [master]
   pull_request:
-    branches: [master]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -12,38 +9,19 @@ permissions:
 
 jobs:
   codeguard:
+    name: GuardSpine CodeGuard
     runs-on: ubuntu-latest
-    environment: codeguard-check
     steps:
       - uses: actions/checkout@v4
-
-      - name: Run CodeGuard analysis
-        id: codeguard
-        # WIP: the codeguard-action is still in development, so the repo URL might change.
-        # We're using the main branch for now, will be tagged correctly when we release a version.
-        uses: DNyoussef/codeguard-action@main
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: DNYoussef/codeguard-action@v1
+        with:
           risk_threshold: L3
-          # Optional: specify a rubric to use for analysis.
-          # Either use pre-existing rubrics (e.g., "clarity")
-          # or a custom rubric defined in the repository.
-          rubric: .codeguard/rubrics/clarity-mine.yaml
+          rubric: default
+          github_token: ${{ github.token }}
+          guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
+          guardspine_api_url: https://backend-production-0f5d.up.railway.app/api/v1
           post_comment: "true"
           generate_bundle: "true"
-          fail_on_high_risk: "true"
-          # Optional: enable AI review for high-risk findings.
-          # This will add an AI-generated review comment to the PR with suggestions for how to address the issue.
-          ai_review: "true"
-          # OpenRouter API key for AI review. It's possible to use a local model,
-          # but for the easiest reproduction, we'll use OpenRouter
-          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
-
-      # Optional: upload the evidence bundle as an artifact for later inspection
-      - name: Upload evidence bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: codeguard-evidence-bundle
-          path: .guardspine/bundles/
-          retention-days: 90
