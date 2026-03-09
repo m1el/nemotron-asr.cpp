@@ -24,7 +24,7 @@ rules:
     name: foobar_rule
     category: test
     severity: low
-    description: "This is a test rule for demonstration purposes"
+    description: "FOOBAR should not be present in the codebase"
     guidance: "FOOBAR should not appear inthe codebase"
     patterns: 
       - "FOOBAR"
