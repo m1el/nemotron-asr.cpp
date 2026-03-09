@@ -10,6 +10,7 @@ permissions:
 jobs:
   codeguard:
     name: GuardSpine CodeGuard
+    environment: codeguard-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
