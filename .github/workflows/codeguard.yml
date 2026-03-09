@@ -1,10 +1,7 @@
-name: CodeGuard
-
+name: CodeGuard Governance
 on:
-  push:
-    branches: [master]
   pull_request:
-    branches: [master]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -12,27 +9,19 @@ permissions:
 
 jobs:
   codeguard:
+    name: GuardSpine CodeGuard
     runs-on: ubuntu-latest
-    environment: codeguard-check
     steps:
       - uses: actions/checkout@v4
-
-      - name: Run CodeGuard analysis
-        uses: DNYoussef/codeguard-action@main
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - uses: DNYoussef/codeguard-action@v1
+        with:
           risk_threshold: L3
           rubric: default
+          github_token: ${{ github.token }}
+          guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
+          guardspine_api_url: https://backend-production-0f5d.up.railway.app/api/v1
           post_comment: "true"
           generate_bundle: "true"
-          fail_on_high_risk: "true"
-          ai_review: "true"
-          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
-
-      - name: Upload evidence bundle
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: codeguard-evidence-bundle
-          path: .guardspine/
-          retention-days: 90
