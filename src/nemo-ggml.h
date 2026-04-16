@@ -7,13 +7,8 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
+// Backend headers not needed with dynamic loading
+// Backends are loaded via ggml_backend_init_by_name() or ggml_backend_init_by_type()
 
 #include <cstdint>
 #include <string>
@@ -21,14 +16,6 @@
 #include <map>
 
 struct timed_token;
-
-// Backend type for inference
-enum nemo_backend_type {
-    NEMO_BACKEND_CPU = 0,
-    NEMO_BACKEND_CUDA = 1,
-    NEMO_BACKEND_METAL = 2,
-    NEMO_BACKEND_AUTO = 3,  // Auto-detect: prefer CUDA if available
-};
 
 // Forward declaration
 struct nemo_preprocessor;
@@ -181,7 +168,7 @@ struct nemo_model {
     struct ggml_context * ctx_w;          // weights context
     ggml_backend_t backend;
     ggml_backend_buffer_t buffer_w;
-    nemo_backend_type backend_type;       // which backend is in use
+    std::string backend_name;             // which backend is in use
 
     // Tensor name mapping for loading
     std::map<std::string, struct ggml_tensor *> tensors;
@@ -227,11 +214,12 @@ struct nemo_context {
 };
 
 // API functions
-// Initialize with automatic backend selection (prefers CUDA if available)
+// Initialize with automatic backend selection (uses first available backend from GGML registry)
 struct nemo_context * nemo_init(const char * model_path);
 
-// Initialize with specific backend
-struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backend_type backend);
+// Initialize with specific backend by name (e.g., "CPU", "CUDA", "Vulkan", "Metal")
+// Pass nullptr for backend_name to use automatic selection
+struct nemo_context * nemo_init_with_backend(const char * model_path, const char * backend_name);
 
 void nemo_free(struct nemo_context * ctx);
 
@@ -239,7 +227,8 @@ void nemo_free(struct nemo_context * ctx);
 const char * nemo_get_backend_name(struct nemo_context * ctx);
 
 // Load model weights from file (with backend selection)
-bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_type backend = NEMO_BACKEND_AUTO);
+// Pass nullptr for backend_name to use automatic selection
+bool nemo_model_load(const std::string & path, nemo_model & model, const char * backend_name = nullptr);
 
 // Build computation graphs
 struct ggml_cgraph * nemo_build_encoder_graph(

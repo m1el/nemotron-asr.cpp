@@ -24,16 +24,31 @@
 #endif
 
 static void print_usage(const char * prog) {
-    fprintf(stderr, "Usage: %s <model.gguf> <audio.pcm|-|--stdin> [chunk_ms] [right_context] [--cpu|--cuda]\n", prog);
+    fprintf(stderr, "Usage: %s <model.gguf> <audio.pcm|-|--stdin> [chunk_ms] [right_context] [--backend <name>]\n", prog);
     fprintf(stderr, "\n");
     fprintf(stderr, "  model.gguf      - GGUF model file\n");
     fprintf(stderr, "  audio.pcm       - Audio file (PCM i16le 16kHz mono)\n");
     fprintf(stderr, "  - or --stdin    - Read audio from stdin\n");
     fprintf(stderr, "  chunk_ms        - Chunk size in milliseconds (default: 80)\n");
     fprintf(stderr, "  right_context   - Attention right context (0, 1, 6, or 13, default: 0)\n");
-    fprintf(stderr, "  --cpu           - Force CPU backend\n");
-    fprintf(stderr, "  --cuda          - Force CUDA backend\n");
-    fprintf(stderr, "  --metal         - Force Metal backend\n");
+    fprintf(stderr, "  --backend <name> - Select backend (default: auto-select first available)\n");
+    fprintf(stderr, "\n");
+
+    // Load backends to discover what's available
+    ggml_backend_load_all();
+    size_t dev_count = ggml_backend_dev_count();
+
+    fprintf(stderr, "Available backends:\n");
+    if (dev_count == 0) {
+        fprintf(stderr, "  (none available)\n");
+    } else {
+        for (size_t i = 0; i < dev_count; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const char * dev_name = ggml_backend_dev_name(dev);
+            fprintf(stderr, "  %s%s\n", dev_name, i == 0 ? " (default)" : "");
+        }
+    }
+
     fprintf(stderr, "\n");
     fprintf(stderr, "Streaming modes:\n");
     fprintf(stderr, "  right_context=0  - Pure causal, 80ms latency\n");
@@ -43,10 +58,9 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0\n", prog);
-    fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0 --cuda\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0 --backend Vulkan\n", prog);
     fprintf(stderr, "  ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - | %s weights/model.gguf -\n", prog);
-    fprintf(stderr, "  arecord -f S16_LE -r 16000 -c 1 - | %s weights/model.gguf - 80 0 --cuda\n", prog);
-    fprintf(stderr, "  %s weights/model.gguf audio.pcm 80 0 --metal\n", prog);
+    fprintf(stderr, "  arecord -f S16_LE -r 16000 -c 1 - | %s weights/model.gguf - 80 0 --backend CPU\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -59,29 +73,37 @@ int main(int argc, char ** argv) {
     const char * audio_path = argv[2];
     int chunk_ms = 80;  // default 80ms chunks
     int right_context = 0;  // default: pure causal
-    nemo_backend_type backend = NEMO_BACKEND_AUTO;
+    const char * backend_name = nullptr;  // nullptr = auto-select
     bool read_from_stdin = (strcmp(audio_path, "-") == 0 || strcmp(audio_path, "--stdin") == 0);
 
     // Parse arguments
+    int positional_arg = 0;  // track which positional argument we're on (after model and audio)
     for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--cpu") == 0) {
-            backend = NEMO_BACKEND_CPU;
-        } else if (strcmp(argv[i], "--cuda") == 0) {
-            backend = NEMO_BACKEND_CUDA;
-        } else if (strcmp(argv[i], "--metal") == 0) {
-            backend = NEMO_BACKEND_METAL;
-        } else if (i == 3) {
-            chunk_ms = atoi(argv[i]);
-            if (chunk_ms < 10) {
-                fprintf(stderr, "Error: chunk_ms must be >= 10 (got %d)\n", chunk_ms);
+        if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 < argc) {
+                backend_name = argv[i + 1];
+                i++;  // skip next argument
+            } else {
+                fprintf(stderr, "Error: --backend requires a backend name\n");
                 return 1;
             }
-        } else if (i == 4) {
-            right_context = atoi(argv[i]);
-            if (right_context != 0 && right_context != 1 &&
-                right_context != 6 && right_context != 13) {
-                fprintf(stderr, "Warning: non-standard right_context=%d (use 0, 1, 6, or 13)\n",
-                        right_context);
+        } else {
+            // Positional arguments: chunk_ms, then right_context
+            if (positional_arg == 0) {
+                chunk_ms = atoi(argv[i]);
+                if (chunk_ms < 10) {
+                    fprintf(stderr, "Error: chunk_ms must be >= 10 (got %d)\n", chunk_ms);
+                    return 1;
+                }
+                positional_arg++;
+            } else if (positional_arg == 1) {
+                right_context = atoi(argv[i]);
+                if (right_context != 0 && right_context != 1 &&
+                    right_context != 6 && right_context != 13) {
+                    fprintf(stderr, "Warning: non-standard right_context=%d (use 0, 1, 6, or 13)\n",
+                            right_context);
+                }
+                positional_arg++;
             }
         }
     }
@@ -98,7 +120,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
 
     fprintf(stderr, "Loading model from %s...\n", model_path);
-    struct nemo_context * ctx = nemo_init_with_backend(model_path, backend);
+    struct nemo_context * ctx = nemo_init_with_backend(model_path, backend_name);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;

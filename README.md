@@ -52,12 +52,14 @@ Once you have built ggml, you can build this binary
 make nemotron-asr.cpp
 ```
 
+All of the ggml backends that you built with should be available to `nemotron-asr.cpp` through the `--backend` flag.
+
 ## Comparison to [whisper.cpp](https://github.com/ggml-org/whisper.cpp)?
 
 1) Whisper operates on 30s audio chunks, so it is not feasible to use in interactive applications.
 NeMotron's ASR model has configurable latency (from 80ms to 1.12s), which can traded for quality and speed. (bigger lookahead gives better quality and bigger chunks require less work)
 2) Whisper has troubles on long audio streams, where NeMotron's ASR is a streaming model, works for infinite streams. It does get stuck in lowercase mode though.
-3) Quiality seems to be better
+3) Quality seems to be better
 
 ## License
 

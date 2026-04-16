@@ -8,34 +8,10 @@ CXXFLAGS = -g -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I $(GGML_DIR)/include
 CXXFLAGS += -I include
 
-# Check if CUDA backend is available
-CUDA_LIB = $(GGML_BUILD)/src/ggml-cuda/libggml-cuda.so
-CUDA_AVAILABLE = $(shell test -f $(CUDA_LIB) && echo 1 || echo 0)
-
-METAL_LIB = $(GGML_BUILD)/src/ggml-metal/libggml-metal.dylib
-METAL_AVAILABLE = $(shell test -f $(METAL_LIB) && echo 1 || echo 0)
-
 LDFLAGS = -L $(GGML_BUILD)/src
-LDFLAGS += -lggml -lggml-base -lggml-cpu
+LDFLAGS += -lggml -lggml-base
 LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
-LDFLAGS += -lm -lpthread
-
-# Add CUDA support if available
-ifeq ($(CUDA_AVAILABLE),1)
-    CXXFLAGS += -DGGML_USE_CUDA
-    LDFLAGS += -L $(GGML_BUILD)/src/ggml-cuda -lggml-cuda
-    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src/ggml-cuda
-    LDFLAGS += -L /usr/local/cuda/lib64 -lcudart -lcublas
-    LDFLAGS += -Wl,-rpath,/usr/local/cuda/lib64
-endif
-
-# Add Metal support if available
-ifeq ($(METAL_AVAILABLE),1)
-	CXXFLAGS += -DGGML_USE_METAL
-	LDFLAGS += -L $(GGML_BUILD)/src/ggml-metal -lggml-metal
-	LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src/ggml-metal
-	LDFLAGS += -framework Metal -framework Foundation
-endif
+LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/bin
 
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
