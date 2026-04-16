@@ -112,78 +112,78 @@ bool test_latency_modes() {
     
     // Test pure causal (80ms)
     {
-        nemo_cache_config cfg = nemo_cache_config::pure_causal();
+        nemo_cache_config cfg = nemo_cache_config_with_latency(NEMO_LATENCY_PURE_CAUSAL);
         if (cfg.att_right_context != 0) {
             printf(RED "FAIL" RESET " (pure_causal right_context=%u, expected 0)\n", cfg.att_right_context);
             return false;
         }
-        if (cfg.get_chunk_mel_frames() != 8) {
-            printf(RED "FAIL" RESET " (pure_causal mel_frames=%zu, expected 8)\n", cfg.get_chunk_mel_frames());
+        if (nemo_cache_config_get_chunk_mel_frames(&cfg) != 8) {
+            printf(RED "FAIL" RESET " (pure_causal mel_frames=%zu, expected 8)\n", nemo_cache_config_get_chunk_mel_frames(&cfg));
             return false;
         }
-        if (cfg.get_latency_ms() != 80) {
-            printf(RED "FAIL" RESET " (pure_causal latency=%ums, expected 80)\n", cfg.get_latency_ms());
+        if (nemo_cache_config_get_latency_ms(&cfg) != 80) {
+            printf(RED "FAIL" RESET " (pure_causal latency=%ums, expected 80)\n", nemo_cache_config_get_latency_ms(&cfg));
             return false;
         }
     }
     
     // Test ultra-low latency (160ms)
     {
-        nemo_cache_config cfg = nemo_cache_config::ultra_low_latency();
+        nemo_cache_config cfg = nemo_cache_config_with_latency(NEMO_LATENCY_ULTRA_LOW);
         if (cfg.att_right_context != 1) {
             printf(RED "FAIL" RESET " (ultra_low right_context=%u, expected 1)\n", cfg.att_right_context);
             return false;
         }
-        if (cfg.get_chunk_mel_frames() != 16) {
-            printf(RED "FAIL" RESET " (ultra_low mel_frames=%zu, expected 16)\n", cfg.get_chunk_mel_frames());
+        if (nemo_cache_config_get_chunk_mel_frames(&cfg) != 16) {
+            printf(RED "FAIL" RESET " (ultra_low mel_frames=%zu, expected 16)\n", nemo_cache_config_get_chunk_mel_frames(&cfg));
             return false;
         }
-        if (cfg.get_latency_ms() != 160) {
-            printf(RED "FAIL" RESET " (ultra_low latency=%ums, expected 160)\n", cfg.get_latency_ms());
+        if (nemo_cache_config_get_latency_ms(&cfg) != 160) {
+            printf(RED "FAIL" RESET " (ultra_low latency=%ums, expected 160)\n", nemo_cache_config_get_latency_ms(&cfg));
             return false;
         }
     }
     
     // Test low latency (560ms)
     {
-        nemo_cache_config cfg = nemo_cache_config::low_latency();
+        nemo_cache_config cfg = nemo_cache_config_with_latency(NEMO_LATENCY_LOW);
         if (cfg.att_right_context != 6) {
             printf(RED "FAIL" RESET " (low right_context=%u, expected 6)\n", cfg.att_right_context);
             return false;
         }
-        if (cfg.get_chunk_mel_frames() != 56) {
-            printf(RED "FAIL" RESET " (low mel_frames=%zu, expected 56)\n", cfg.get_chunk_mel_frames());
+        if (nemo_cache_config_get_chunk_mel_frames(&cfg) != 56) {
+            printf(RED "FAIL" RESET " (low mel_frames=%zu, expected 56)\n", nemo_cache_config_get_chunk_mel_frames(&cfg));
             return false;
         }
-        if (cfg.get_latency_ms() != 560) {
-            printf(RED "FAIL" RESET " (low latency=%ums, expected 560)\n", cfg.get_latency_ms());
+        if (nemo_cache_config_get_latency_ms(&cfg) != 560) {
+            printf(RED "FAIL" RESET " (low latency=%ums, expected 560)\n", nemo_cache_config_get_latency_ms(&cfg));
             return false;
         }
     }
     
     // Test balanced/default (1120ms)
     {
-        nemo_cache_config cfg = nemo_cache_config::balanced();
+        nemo_cache_config cfg = nemo_cache_config_with_latency(NEMO_LATENCY_DEFAULT);
         if (cfg.att_right_context != 13) {
             printf(RED "FAIL" RESET " (balanced right_context=%u, expected 13)\n", cfg.att_right_context);
             return false;
         }
-        if (cfg.get_chunk_mel_frames() != 112) {
-            printf(RED "FAIL" RESET " (balanced mel_frames=%zu, expected 112)\n", cfg.get_chunk_mel_frames());
+        if (nemo_cache_config_get_chunk_mel_frames(&cfg) != 112) {
+            printf(RED "FAIL" RESET " (balanced mel_frames=%zu, expected 112)\n", nemo_cache_config_get_chunk_mel_frames(&cfg));
             return false;
         }
-        if (cfg.get_latency_ms() != 1120) {
-            printf(RED "FAIL" RESET " (balanced latency=%ums, expected 1120)\n", cfg.get_latency_ms());
+        if (nemo_cache_config_get_latency_ms(&cfg) != 1120) {
+            printf(RED "FAIL" RESET " (balanced latency=%ums, expected 1120)\n", nemo_cache_config_get_latency_ms(&cfg));
             return false;
         }
     }
     
     // Test get_chunk_samples calculation
     {
-        nemo_cache_config cfg = nemo_cache_config::pure_causal();
+        nemo_cache_config cfg = nemo_cache_config_with_latency(NEMO_LATENCY_PURE_CAUSAL);
         // chunk_samples = chunk_mel_frames * hop_length = 8 * 160 = 1280
-        if (cfg.get_chunk_samples() != 1280) {
-            printf(RED "FAIL" RESET " (pure_causal samples=%d, expected 1280)\n", cfg.get_chunk_samples());
+        if (nemo_cache_config_get_chunk_samples(&cfg) != 1280) {
+            printf(RED "FAIL" RESET " (pure_causal samples=%d, expected 1280)\n", nemo_cache_config_get_chunk_samples(&cfg));
             return false;
         }
     }
@@ -758,7 +758,7 @@ bool test_e2e_streaming(struct nemo_context* ctx) {
     std::string full_result = nemo_transcribe_audio(ctx, audio);
     
     // Method 2: Chunked streaming processing
-    nemo_cache_config config = nemo_cache_config::default_config();
+    nemo_cache_config config = nemo_cache_config_default();
     struct nemo_stream_context* sctx = nemo_stream_init(ctx, &config);
     if (!sctx) {
         printf(RED "FAIL" RESET " (stream init failed)\n");
@@ -766,7 +766,7 @@ bool test_e2e_streaming(struct nemo_context* ctx) {
     }
     
     std::string stream_result;
-    const int chunk_size = config.get_chunk_samples();  // Samples per chunk based on latency mode
+    const int chunk_size = nemo_cache_config_get_chunk_samples(&config);  // Samples per chunk based on latency mode
     
     for (int offset = 0; offset < duration_samples; offset += chunk_size) {
         int remaining = duration_samples - offset;
@@ -822,7 +822,7 @@ bool test_incremental_streaming(struct nemo_context* ctx) {
     }
     
     // Use incremental streaming
-    nemo_cache_config config = nemo_cache_config::default_config();
+    nemo_cache_config config = nemo_cache_config_default();
     struct nemo_stream_context* sctx = nemo_stream_init(ctx, &config);
     if (!sctx) {
         printf(RED "FAIL" RESET " (stream init failed)\n");
@@ -830,7 +830,7 @@ bool test_incremental_streaming(struct nemo_context* ctx) {
     }
     
     std::string incremental_result;
-    const int chunk_size = config.get_chunk_samples();  // Samples per chunk based on latency mode
+    const int chunk_size = nemo_cache_config_get_chunk_samples(&config);  // Samples per chunk based on latency mode
     int chunks_processed = 0;
     
     for (int offset = 0; offset < duration_samples; offset += chunk_size) {

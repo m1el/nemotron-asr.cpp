@@ -1,8 +1,8 @@
 // Test GGML implementation against Python reference data
 // Uses numpy files exported from test_streaming_cache.py and export_layer_data.py
 
-#include "../src-ggml/nemo-ggml.h"
-#include "../src-ggml/nemo-stream.h"
+#include "../src/nemo-ggml.h"
+#include "../src/nemo-stream.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

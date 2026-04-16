@@ -128,7 +128,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Model loaded successfully (backend: %s)\n", nemo_get_backend_name(ctx));
 
     // Initialize cache-aware streaming context
-    nemo_cache_config cache_cfg = nemo_cache_config::default_config();
+    nemo_cache_config cache_cfg = nemo_cache_config_default();
     cache_cfg.att_right_context = right_context;  // User-selected latency mode
 
     struct nemo_stream_context * sctx = nemo_stream_init(ctx, &cache_cfg);
@@ -138,7 +138,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    int computed_chunk_samples = cache_cfg.get_chunk_samples();
+    int computed_chunk_samples = nemo_cache_config_get_chunk_samples(&cache_cfg);
     size_t total_samples_processed = 0;
 
     // Open input source (stdin or file)

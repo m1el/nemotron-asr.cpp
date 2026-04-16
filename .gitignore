@@ -1,6 +1,8 @@
 *.bin
 *.o
 *.npy
+*.a
+*.so
 preprocessor
 nemotron-speech
 ggml/
