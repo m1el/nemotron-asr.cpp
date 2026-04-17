@@ -36,10 +36,9 @@ Additionally, those changes also help with quantization, which has requirements 
 
 ## Development
 
-To develop this project you need to clone [ggml-org/ggml](https://github.com/ggml-org/ggml) to this directory, then build ggml with all your favorite settings. TODO: Maybe make this process more friendly? PRs welcome.
-
+First, build ggml with all your favorite settings.
 ```bash
-git clone https://github.com/ggml-org/ggml.git
+git subdmodule update --init
 mkdir ggml/build
 cd ggml/build
 cmake ..

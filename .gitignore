@@ -5,7 +5,6 @@
 *.so
 preprocessor
 nemotron-speech
-ggml/
 nemotron-asr.cpp
 
 # Test binaries
