@@ -1,17 +1,27 @@
 # Makefile for ggml-based NeMo ASR implementation
 
-GGML_DIR = ggml
-GGML_BUILD = $(GGML_DIR)/build
+GGML_DIR ?= ggml
+GGML_BUILD ?= $(GGML_DIR)/build
 
-CXX = g++
-CXXFLAGS = -g -std=c++17 -Wall -Wextra -O2
+CXX ?= g++
+CXXFLAGS ?= -g -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I $(GGML_DIR)/include
 CXXFLAGS += -I include
 
-LDFLAGS = -L $(GGML_BUILD)/src
-LDFLAGS += -lggml -lggml-base
-LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
-LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/bin
+# Detect static libraries in GGML build directory
+GGML_STATIC_LIBS := $(wildcard $(GGML_BUILD)/src/*.a)
+
+# Configure linking based on whether static libraries are available
+ifneq ($(GGML_STATIC_LIBS),)
+    # Static linking - use .a files directly
+    LDFLAGS += $(GGML_STATIC_LIBS)
+else
+    # Dynamic linking - use -l flags and rpath
+    LDFLAGS += -L $(GGML_BUILD)/src
+    LDFLAGS += -lggml -lggml-base
+    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
+    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/bin
+endif
 
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
