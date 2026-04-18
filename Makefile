@@ -1,55 +1,54 @@
 # Makefile for ggml-based NeMo ASR implementation
 
-GGML_DIR = ggml
-GGML_BUILD = $(GGML_DIR)/build
+GGML_DIR ?= ggml
+GGML_BUILD ?= $(GGML_DIR)/build
 
-CXX = g++
-CXXFLAGS = -g -std=c++17 -Wall -Wextra -O2
+CXX ?= g++
+CXXFLAGS ?= -g -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I $(GGML_DIR)/include
 CXXFLAGS += -I include
 
-# Check if CUDA backend is available
-CUDA_LIB = $(GGML_BUILD)/src/ggml-cuda/libggml-cuda.so
-CUDA_AVAILABLE = $(shell test -f $(CUDA_LIB) && echo 1 || echo 0)
+# Detect static libraries in GGML build directory
+GGML_STATIC_LIBS := $(wildcard $(GGML_BUILD)/src/*.a)
 
-METAL_LIB = $(GGML_BUILD)/src/ggml-metal/libggml-metal.dylib
-METAL_AVAILABLE = $(shell test -f $(METAL_LIB) && echo 1 || echo 0)
-
-LDFLAGS = -L $(GGML_BUILD)/src
-LDFLAGS += -lggml -lggml-base -lggml-cpu
-LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
-LDFLAGS += -lm -lpthread
-
-# Add CUDA support if available
-ifeq ($(CUDA_AVAILABLE),1)
-    CXXFLAGS += -DGGML_USE_CUDA
-    LDFLAGS += -L $(GGML_BUILD)/src/ggml-cuda -lggml-cuda
-    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src/ggml-cuda
-    LDFLAGS += -L /usr/local/cuda/lib64 -lcudart -lcublas
-    LDFLAGS += -Wl,-rpath,/usr/local/cuda/lib64
-endif
-
-# Add Metal support if available
-ifeq ($(METAL_AVAILABLE),1)
-	CXXFLAGS += -DGGML_USE_METAL
-	LDFLAGS += -L $(GGML_BUILD)/src/ggml-metal -lggml-metal
-	LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src/ggml-metal
-	LDFLAGS += -framework Metal -framework Foundation
+# Configure linking based on whether static libraries are available
+ifneq ($(GGML_STATIC_LIBS),)
+    # Static linking - use .a files directly
+    LDFLAGS += $(GGML_STATIC_LIBS)
+else
+    # Dynamic linking - use -l flags and rpath
+    LDFLAGS += -L $(GGML_BUILD)/src
+    LDFLAGS += -lggml -lggml-base
+    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
+    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/bin
 endif
 
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
 GGML_STREAM_SRCS = src/nemo-stream.cpp
+C_WRAPPER_SRCS = src/nemotron_asr_c.cpp
 
 # Original implementation (for comparison tests)
 ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/conv_subsampling.cpp src/reference/conformer_modules.cpp src/reference/conformer_encoder.cpp src/reference/rnnt_decoder.cpp src/reference/rnnt_joint.cpp src/reference/greedy_decode.cpp src/reference/tokenizer.cpp
 
-.PHONY: all clean clean_bin test transcribe streaming
+.PHONY: all clean clean_bin test transcribe streaming lib
 
 all: nemotron-asr.cpp
 # test_ggml_weights test_ggml_compute transcribe streaming
 
 streaming: test_streaming nemotron-asr.cpp
+
+# C wrapper library for FFI (static and shared)
+lib: libnemotron_asr.a libnemotron_asr.so
+
+libnemotron_asr.a: $(GGML_SRCS:.cpp=.o) $(GGML_STREAM_SRCS:.cpp=.o) $(C_WRAPPER_SRCS:.cpp=.o)
+	ar rcs $@ $^
+
+libnemotron_asr.so: $(GGML_SRCS) $(GGML_STREAM_SRCS) $(C_WRAPPER_SRCS)
+	$(CXX) $(CXXFLAGS) -fPIC -shared $^ $(LDFLAGS) -o $@
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -fPIC -c $< -o $@
 
 # Test weight loading
 test_ggml_weights: tests/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
@@ -85,6 +84,8 @@ nemotron-asr.cpp: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 
 clean:
 	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor
+	rm -f libnemotron_asr.a libnemotron_asr.so
+	rm -f src/*.o
 
 clean_bin:
 	rm my_bin/*

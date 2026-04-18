@@ -1,8 +1,11 @@
 *.bin
 *.o
 *.npy
+*.a
+*.so
 preprocessor
 nemotron-speech
+nemotron-asr.cpp
 
 # Test binaries
 test_*
