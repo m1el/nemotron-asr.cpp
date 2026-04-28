@@ -78,12 +78,16 @@ The CLI takes the ASR gguf and the diarize gguf as separate arguments.
 
 ## Subnet 1: MarbleNet VAD (`vad_multilingual_marblenet`)
 
-Reference config: `NeMo/examples/asr/conf/marblenet/marblenet_3x2x64.yaml`.
+Reference config: lifted directly from the published `.nemo` checkpoint (the
+`marblenet_3x2x64.yaml` example file in the NeMo repo describes the *English-only*
+variant which differs in front-end). 84 tensors, ~114K params total in the
+multilingual variant.
 
-- **Front-end:** `AudioToMFCCPreprocessor` — 64 MFCC, 25 ms window, 10 ms stride,
-  hann, n_fft=512. Distinct from the ASR side's mel-spectrogram pipeline; needs a new
-  `marblenet_preprocess()` (DCT on top of log-mel). Likely 50–100 lines on top of the
-  existing FFT/mel code in `src/preprocessor.cpp`.
+- **Front-end:** the multilingual checkpoint actually uses
+  `AudioToMelSpectrogramPreprocessor` with **80 log-mel** (not the 64-MFCC of the
+  English `marblenet_3x2x64`), 25 ms window, 10 ms stride, hann, n_fft=512,
+  `normalize: None` (raw log-mel, no per-feature normalization). This is the same
+  shape as TitaNet's preprocessor, just without normalization.
 - **Encoder (`ConvASREncoder`, "Jasper" blocks):**
   - Block 0: separable, k=11, 64→128, no residual
   - Blocks 1–3: separable, k=13/15/17, 128→64, repeat=2, residual
@@ -105,16 +109,24 @@ Reference config: `NeMo/examples/speaker_tasks/recognition/conf/titanet-large.ya
 - **Front-end:** `AudioToMelSpectrogramPreprocessor` — 80-mel, per-feature normalize,
   25 ms / 10 ms, n_fft=512. Re-uses most of the existing ASR mel code, but the ASR
   model uses 128 mels with different normalization, so we need a separate config path.
-- **Encoder (Jasper + SE):**
-  - Block 0: separable, k=3, 80→1024, residual=False
-  - Blocks 1–3: separable, k=7/11/15, 1024→1024, repeat=3, residual=True, **SE on**
-  - Block 4: separable, k=1, 1024→3072, no residual
-  - SE block: global avg over time → linear (1024→128) → ReLU → linear (128→1024) →
+- **Encoder (Jasper + SE):** all 5 blocks have SE in this checkpoint (including the
+  no-residual prologue and epilogue).
+  - Block 0: separable, k=3, 80→1024, residual=False, SE
+  - Blocks 1–3: separable, k=7/11/15, 1024→1024, repeat=3, residual=True, SE
+  - Block 4: separable, k=1, 1024→3072, no residual, SE (squeeze ratio 8: 3072→384)
+  - SE block: global avg over time → linear (C→C/8) → ReLU → linear (C/8→C) →
     sigmoid → multiply per-channel.
-- **Decoder (`SpeakerDecoder`, attention pooling):**
-  - Attention head: linear (3072→128) → tanh → linear (128→3072) → softmax over time
-  - Weighted mean + weighted std over time → concat (6144-d) → linear 6144→192
-  - L2 normalize → 192-d embedding. (We ignore the 7205-class softmax classifier head.)
+- **Decoder (`SpeakerDecoder`, attention pooling):** input is (B, 3072, T).
+  - Compute mean/std along T (length-masked).
+  - Build context: `concat([x, mean, std], dim=channels)` → (B, **9216**, T).
+  - `TDNNModule(9216→128, k=1)` = Conv1d + ReLU + BN(128).  *(yes, ReLU before BN.)*
+  - `Tanh`.
+  - Conv1d(128→3072, k=1).
+  - Mask, softmax over T → α (B, 3072, T).
+  - Weighted mean and weighted std of original x using α as weights → 2 × (B, 3072).
+  - Concat → (B, 6144, 1).
+  - BN(6144) → Conv1d(6144→192, k=1) → squeeze T=1 → 192-d embedding.
+  - L2 normalize → 192-d embedding. (We ignore the 16681-class classifier `decoder.final`.)
 - **Inference unit:** 1.5 s window. TitaNet was trained on 3 s segments but is robust to
   shorter; NeMo's diarizer defaults sit at 1.5 s as well.
 
