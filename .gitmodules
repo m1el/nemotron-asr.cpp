@@ -1,0 +1,6 @@
+[submodule "ggml"]
+	path = ggml
+	url = https://github.com/ggml-org/ggml.git
+[submodule "vendor/eigen"]
+	path = vendor/eigen
+	url = https://gitlab.com/libeigen/eigen.git

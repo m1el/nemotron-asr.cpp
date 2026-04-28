@@ -36,21 +36,28 @@ Additionally, those changes also help with quantization, which has requirements 
 
 ## Development
 
-To develop this project you need to clone [ggml-org/ggml](https://github.com/ggml-org/ggml) to this directory, then build ggml with all your favorite settings. TODO: Maybe make this process more friendly? PRs welcome.
+ggml and Eigen are vendored as git submodules. After cloning:
 
 ```bash
-git clone https://github.com/ggml-org/ggml.git
-mkdir ggml/build
-cd ggml/build
-cmake ..
-make -j8
-cd ../..
+git submodule update --init --recursive
 ```
 
-Once you have built ggml, you can build this binary
+(Or pass `--recurse-submodules` to the original `git clone`.)
+
+Build ggml:
+
+```bash
+cmake -S ggml -B ggml/build
+cmake --build ggml/build -j8
+```
+
+Then build this binary:
+
 ```bash
 make nemotron-asr.cpp
 ```
+
+Eigen is header-only (`vendor/eigen`) — used by the diarization code, no separate build step.
 
 ## Comparison to [whisper.cpp](https://github.com/ggml-org/whisper.cpp)?
 
