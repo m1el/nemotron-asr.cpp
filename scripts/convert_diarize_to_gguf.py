@@ -147,12 +147,15 @@ def reshape_for_ggml(orig_name: str, data: np.ndarray) -> tuple[np.ndarray, str]
     """
     if data.ndim == 3:
         out, mid, k = data.shape
-        if k == 1 and mid >= 1:
-            # pointwise: (out, in, 1) -> (out, in)
-            return data.squeeze(axis=2), "pointwise->2D"
-        if mid == 1 and k > 1:
-            # depthwise: (ch, 1, k) -> (k, ch)
+        # Check depthwise FIRST. Depthwise has middle dim == 1 (groups == out),
+        # which holds even for k=1 (like TitaNet block 4). If we checked
+        # pointwise (k==1) first, depthwise-k=1 would get the wrong reshape.
+        if mid == 1:
+            # depthwise: (ch, 1, k) -> (k, ch)  → ggml ne=(ch, k)
             return data.squeeze(axis=1).T.copy(), "depthwise->(k,ch)"
+        if k == 1:
+            # pointwise: (out, in, 1) -> (out, in)  → ggml ne=(in, out)
+            return data.squeeze(axis=2), "pointwise->2D"
     return data, ""
 
 
