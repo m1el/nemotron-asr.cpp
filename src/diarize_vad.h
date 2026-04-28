@@ -80,4 +80,67 @@ bool vad_graph_compute(
 
 void vad_graph_free(vad_graph & g);
 
+// ---- High-level streaming-friendly API -------------------------------------
+
+constexpr int kVadSampleRate    = 16000;
+constexpr int kVadWindowSamples = 10080;  // 0.63 s
+constexpr int kVadShiftSamples  = 160;    // 0.01 s
+constexpr int kVadMelValid      = 63;
+constexpr int kVadMelPadded     = 64;     // pad_to=16 → ceil(63/16)*16
+constexpr int kVadNMels         = 80;
+
+struct vad_session;
+
+// Initialize a VAD session backed by `m` (loaded diarize.gguf) and `w`
+// (resolved vad weights). Both must outlive the session.
+vad_session * vad_session_init(diarize_model & m, const vad_weights & w);
+void vad_session_free(vad_session * s);
+
+// Run VAD on a batch of audio (16 kHz mono float in [-1, 1]). Appends one
+// speech probability to `out_speech_probs` per 10 ms shift, for shifts
+// where a full 0.63 s window fits inside `audio`. Returns the number of
+// new probabilities appended.
+//
+// At end-of-stream, callers wanting to flush the trailing audio (where
+// the last window would extend past the available samples) can pad
+// `audio` with zeros and pass an explicit shorter `lens` via
+// vad_session_run_chunk.
+size_t vad_session_run_batch(
+    vad_session * s,
+    const float * audio, size_t n_samples,
+    std::vector<float> & out_speech_probs);
+
+// Run a single 0.63 s chunk through preprocessor + encoder + decoder.
+// `audio` must point to >= kVadWindowSamples samples; `lens_samples` is
+// the number of "real" samples (the rest is treated as zero-fill so the
+// MaskedConv1d zeroing applies). For a fully-real chunk pass
+// kVadWindowSamples.
+float vad_session_run_chunk(
+    vad_session * s,
+    const float * audio,
+    int lens_samples = kVadWindowSamples);
+
+// ---- VAD post-processing: probabilities -> speech segments ----------------
+
+struct vad_segment {
+    float start_sec;
+    float end_sec;
+};
+
+struct vad_post_cfg {
+    float onset            = 0.5f;
+    float offset           = 0.5f;
+    float pad_onset        = 0.0f;
+    float pad_offset       = 0.0f;
+    float min_duration_on  = 0.0f;
+    float min_duration_off = 0.0f;
+    float frame_period_sec = 0.01f;
+};
+
+// Threshold-based segment extraction (matching the spirit of NeMo's
+// generate_vad_segment_table_per_tensor). Returns segments sorted by start.
+std::vector<vad_segment> vad_extract_segments(
+    const std::vector<float> & speech_probs,
+    const vad_post_cfg & cfg = {});
+
 #endif // NEMOTRON_DIARIZE_VAD_H

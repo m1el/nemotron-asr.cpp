@@ -353,4 +353,207 @@ void vad_graph_free(vad_graph & g) {
     g.block_out.clear();
     g.encoder_out = nullptr;
     g.mel_input = nullptr;
+    g.mask_input = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// vad_session: high-level API
+// ---------------------------------------------------------------------------
+
+#include "diarize_audio.h"
+
+struct vad_session {
+    diarize_model     * m   = nullptr;     // borrowed
+    const vad_weights * w   = nullptr;     // borrowed
+    vad_graph           graph;             // owned
+    ggml_gallocr_t      alloc = nullptr;   // owned
+
+    // Cached host copies of the small decoder weights (avoids a gallocr round-trip per call).
+    std::vector<float> dec_w;              // (ENC_C * N_CLASSES) row-major ne=(C, K)
+    std::vector<float> dec_b;              // (N_CLASSES,)
+    int n_classes  = 2;
+    int enc_c      = 128;
+
+    // Borrowed pointers to the preprocessor weights inside the gguf-backed buffer.
+    const float * fb     = nullptr;
+    const float * window = nullptr;
+
+    diarize_audio_cfg pp_cfg;
+
+    // Scratch.
+    std::vector<float> mel_pp;        // (n_mels, T_padded) row-major
+    std::vector<float> mel_chan;      // (T_padded, n_mels) channels-innermost
+    std::vector<float> enc_buf;       // (T_padded * ENC_C) channels-innermost
+};
+
+vad_session * vad_session_init(diarize_model & m, const vad_weights & w) {
+    auto * s = new vad_session;
+    s->m = &m;
+    s->w = &w;
+    s->n_classes = w.n_classes;
+    s->enc_c     = w.enc_out_channels;
+
+    s->graph = vad_graph_build(w, kVadMelPadded, kVadNMels);
+    s->alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+
+    s->dec_w.resize((size_t)s->enc_c * s->n_classes);
+    s->dec_b.resize(s->n_classes);
+    ggml_backend_tensor_get(w.dec_w, s->dec_w.data(), 0, s->dec_w.size() * sizeof(float));
+    ggml_backend_tensor_get(w.dec_b, s->dec_b.data(), 0, s->dec_b.size() * sizeof(float));
+
+    auto * fb_t  = diarize_model_get_tensor(m, "vad.preprocessor.featurizer.fb");
+    auto * win_t = diarize_model_get_tensor(m, "vad.preprocessor.featurizer.window");
+    GGML_ASSERT(fb_t && win_t);
+    s->fb     = static_cast<const float *>(fb_t->data);
+    s->window = static_cast<const float *>(win_t->data);
+
+    s->mel_chan.resize((size_t)kVadNMels * kVadMelPadded);
+    s->enc_buf.resize((size_t)s->enc_c * kVadMelPadded);
+
+    return s;
+}
+
+void vad_session_free(vad_session * s) {
+    if (!s) return;
+    if (s->alloc) ggml_gallocr_free(s->alloc);
+    vad_graph_free(s->graph);
+    delete s;
+}
+
+namespace {
+
+void to_chan_first_inplace(const float * in, int C, int T, float * out) {
+    for (int c = 0; c < C; c++)
+        for (int t = 0; t < T; t++)
+            out[(size_t)t * C + c] = in[(size_t)c * T + t];
+}
+
+} // namespace
+
+float vad_session_run_chunk(vad_session * s, const float * audio, int lens_samples) {
+    // Preprocess (always feed the full kVadWindowSamples window — caller is
+    // expected to zero-pad if the audio is shorter).
+    size_t t_valid = 0;
+    size_t t_padded = diarize_compute_logmel(audio, kVadWindowSamples, s->pp_cfg,
+                                             s->fb, s->window, s->mel_pp, &t_valid);
+    GGML_ASSERT((int)t_padded == kVadMelPadded);
+    GGML_ASSERT((int)t_valid  == kVadMelValid);
+    (void)t_padded; (void)t_valid;
+
+    // Determine the per-conv mask threshold: how many mel frames are "real".
+    int lens_mel = lens_samples / kVadShiftSamples;
+    if (lens_mel > kVadMelValid) lens_mel = kVadMelValid;
+    if (lens_mel < 0) lens_mel = 0;
+
+    to_chan_first_inplace(s->mel_pp.data(), kVadNMels, kVadMelPadded, s->mel_chan.data());
+    if (!vad_graph_compute(s->graph, s->m->backend, s->alloc, s->mel_chan.data(), lens_mel)) {
+        return 0.0f;
+    }
+
+    ggml_backend_tensor_get(s->graph.encoder_out, s->enc_buf.data(),
+                            0, s->enc_buf.size() * sizeof(float));
+
+    // AdaptiveAvgPool1d(1): mean over T (all kVadMelPadded frames).
+    std::vector<float> mean_ch(s->enc_c, 0.0f);
+    for (int t = 0; t < kVadMelPadded; t++) {
+        const float * row = s->enc_buf.data() + (size_t)t * s->enc_c;
+        for (int c = 0; c < s->enc_c; c++) mean_ch[c] += row[c];
+    }
+    const float inv_T = 1.0f / (float)kVadMelPadded;
+    for (int c = 0; c < s->enc_c; c++) mean_ch[c] *= inv_T;
+
+    // Linear: logits[k] = sum_c dec_w[c, k] * mean[c] + dec_b[k].
+    // dec_w storage: ne=(C, K), C innermost → memory row dec_w[k*C + c].
+    std::vector<float> logits(s->n_classes);
+    for (int k = 0; k < s->n_classes; k++) {
+        float v = s->dec_b[k];
+        const float * row = s->dec_w.data() + (size_t)k * s->enc_c;
+        for (int c = 0; c < s->enc_c; c++) v += row[c] * mean_ch[c];
+        logits[k] = v;
+    }
+
+    // Softmax over the 2 classes; return P(speech).
+    float mx = logits[0];
+    for (int k = 1; k < s->n_classes; k++) if (logits[k] > mx) mx = logits[k];
+    float Z = 0.0f;
+    for (int k = 0; k < s->n_classes; k++) {
+        logits[k] = std::exp(logits[k] - mx);
+        Z += logits[k];
+    }
+    return (s->n_classes > 1) ? (logits[1] / Z) : 0.0f;
+}
+
+size_t vad_session_run_batch(vad_session * s, const float * audio, size_t n_samples,
+                             std::vector<float> & out) {
+    if ((int)n_samples < kVadWindowSamples) return 0;
+    const int n_chunks = 1 + ((int)n_samples - kVadWindowSamples) / kVadShiftSamples;
+    const size_t before = out.size();
+    out.reserve(before + (size_t)n_chunks);
+    for (int i = 0; i < n_chunks; i++) {
+        const float * chunk = audio + (size_t)i * kVadShiftSamples;
+        out.push_back(vad_session_run_chunk(s, chunk, kVadWindowSamples));
+    }
+    return (size_t)n_chunks;
+}
+
+// ---------------------------------------------------------------------------
+// Segment extraction
+// ---------------------------------------------------------------------------
+
+std::vector<vad_segment> vad_extract_segments(
+    const std::vector<float> & probs,
+    const vad_post_cfg & cfg)
+{
+    std::vector<vad_segment> out;
+    const float fp = cfg.frame_period_sec;
+    const int n = (int)probs.size();
+    const int min_on  = (int)std::ceil(cfg.min_duration_on  / fp);
+    const int min_off = (int)std::ceil(cfg.min_duration_off / fp);
+
+    bool in_seg = false;
+    int  seg_start = -1;
+    for (int t = 0; t < n; t++) {
+        const float p = probs[t];
+        if (!in_seg) {
+            if (p >= cfg.onset) { in_seg = true; seg_start = t; }
+        } else {
+            if (p < cfg.offset) {
+                int seg_end = t;
+                if (seg_end - seg_start >= min_on) {
+                    out.push_back({(seg_start * fp) - cfg.pad_onset,
+                                   (seg_end   * fp) + cfg.pad_offset});
+                }
+                in_seg = false;
+            }
+        }
+    }
+    if (in_seg) {
+        int seg_end = n;
+        if (seg_end - seg_start >= min_on) {
+            out.push_back({(seg_start * fp) - cfg.pad_onset,
+                           (seg_end   * fp) + cfg.pad_offset});
+        }
+    }
+
+    // Merge close segments (separation < min_duration_off).
+    if (min_off > 0 && out.size() >= 2) {
+        std::vector<vad_segment> merged;
+        merged.push_back(out[0]);
+        for (size_t i = 1; i < out.size(); i++) {
+            const float gap_frames = (out[i].start_sec - merged.back().end_sec) / fp;
+            if (gap_frames < min_off) {
+                merged.back().end_sec = out[i].end_sec;
+            } else {
+                merged.push_back(out[i]);
+            }
+        }
+        out = std::move(merged);
+    }
+
+    // Clamp negatives caused by pad_onset > 0.
+    for (auto & seg : out) {
+        if (seg.start_sec < 0.0f) seg.start_sec = 0.0f;
+        if (seg.end_sec   < seg.start_sec) seg.end_sec = seg.start_sec;
+    }
+    return out;
 }
