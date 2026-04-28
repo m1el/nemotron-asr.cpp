@@ -101,17 +101,16 @@ def fetch_pretrained(model_name: str, klass_path: str) -> Path:
 # Tensors we drop entirely:
 #   *.num_batches_tracked        BN bookkeeping, irrelevant at inference
 #   spk.decoder.final.*          16681-class speaker classifier; we only want emb
-#   *.preprocessor.featurizer.*  preprocessor weights (window, fb) — we recompute
-#                                them in C++ from sample_rate/n_mels/n_fft for
-#                                deterministic, dependency-free behavior.
+#
+# We KEEP preprocessor.featurizer.window / fb. They are computed by NeMo via
+# librosa/torchaudio at model construction time — re-deriving them in C++
+# would mean shipping a mel-filterbank computation. Easier and more reliable
+# to ship the precomputed ones.
 DROP_SUFFIXES = (".num_batches_tracked",)
 DROP_SUBSTRINGS_PER_PREFIX = {
     "spk": ("decoder.final.",),
 }
-DROP_PREFIX_PER_NAMESPACE = {
-    "vad": ("preprocessor.",),
-    "spk": ("preprocessor.",),
-}
+DROP_PREFIX_PER_NAMESPACE: dict[str, tuple[str, ...]] = {}
 
 
 def should_drop(orig_name: str, namespace: str) -> Optional[str]:

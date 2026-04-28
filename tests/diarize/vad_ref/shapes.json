@@ -1,0 +1,118 @@
+{
+  "input_audio": [
+    [
+      83200
+    ],
+    "float32"
+  ],
+  "mel": [
+    [
+      1,
+      80,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_0": [
+    [
+      1,
+      128,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_1": [
+    [
+      1,
+      64,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_2": [
+    [
+      1,
+      64,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_3": [
+    [
+      1,
+      64,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_4": [
+    [
+      1,
+      128,
+      528
+    ],
+    "float32"
+  ],
+  "enc_block_5": [
+    [
+      1,
+      128,
+      528
+    ],
+    "float32"
+  ],
+  "encoder_out": [
+    [
+      1,
+      128,
+      528
+    ],
+    "float32"
+  ],
+  "logits": [
+    [
+      1,
+      2
+    ],
+    "float32"
+  ],
+  "probs": [
+    [
+      1,
+      2
+    ],
+    "float32"
+  ],
+  "per_frame_logits": [
+    [
+      1,
+      528,
+      2
+    ],
+    "float32"
+  ],
+  "per_frame_probs": [
+    [
+      1,
+      528,
+      2
+    ],
+    "float32"
+  ],
+  "sw_logits": [
+    [
+      1,
+      466,
+      2
+    ],
+    "float32"
+  ],
+  "sw_probs": [
+    [
+      1,
+      466,
+      2
+    ],
+    "float32"
+  ]
+}
