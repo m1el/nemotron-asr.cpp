@@ -40,7 +40,7 @@ endif
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
 GGML_STREAM_SRCS = src/nemo-stream.cpp
-DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp src/diarize_vad.cpp src/diarize_spk.cpp src/diarize_cluster.cpp
+DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp src/diarize_vad.cpp src/diarize_spk.cpp src/diarize_cluster.cpp src/diarize_pipeline.cpp
 DIARIZE_INCLUDES = -I vendor/eigen
 
 # Original implementation (for comparison tests)
@@ -108,6 +108,9 @@ test_diarize_spk: tests/test_diarize_spk.cpp $(DIARIZE_SRCS)
 	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_cluster: tests/test_diarize_cluster.cpp $(DIARIZE_SRCS)
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
+
+test_diarize_pipeline: tests/test_diarize_pipeline.cpp $(DIARIZE_SRCS)
 	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 clean:
