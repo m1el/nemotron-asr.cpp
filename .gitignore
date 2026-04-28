@@ -4,10 +4,10 @@
 preprocessor
 nemotron-speech
 
-# Test binaries
-test_*
-debug_*
-dump_*
+# Test binaries (anchored to root so source files under tests/ are not ignored)
+/test_*
+/debug_*
+/dump_*
 
 # Editor files
 *.swp
