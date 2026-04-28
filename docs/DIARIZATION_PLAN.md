@@ -95,7 +95,17 @@ multilingual variant.
   - Block 5: 1×1, 128→128, not separable
   Each "separable" sub-conv = depthwise + pointwise + BN + ReLU(+ dropout in train).
 - **Decoder:** `ConvASRDecoderClassification` — global avg-pool over time, linear 128→2.
-- **Inference:** softmax → speech-probability frame stream → threshold/onset/offset to
+- **Inference (streaming-compatible).** The user stream is processed window-by-window
+  to match NeMo's diarizer-side VAD protocol exactly:
+  - Maintain a 0.63 s mel-frame buffer (63 frames at 10 ms hop).
+  - Every 0.01 s (1-frame shift), run the full encoder + AdaptiveAvgPool1d +
+    Linear(128→2) + softmax on the latest 63-frame window → one speech probability.
+  - At 100 Hz output rate, each second of audio costs 100 encoder passes; flops are
+    small (~10 GFLOP/s sustained), so the naïve sliding implementation is fine in v1.
+    Later optimization: cache per-layer conv state across overlapping windows.
+  - This avoids running the encoder over the full clip and naturally streams as audio
+    arrives.
+- **Post-processing:** speech-probability frame stream → threshold/onset/offset to
   segments. NeMo defaults: onset 0.5, offset 0.3, min_duration_on 0.1 s, min_duration_off
   0.2 s, pad_onset 0.05 s, pad_offset −0.05 s.
 
@@ -214,8 +224,13 @@ nemotron-asr.cpp/
 
 ## Phasing / order of work
 
-1. Write `convert_diarize_to_gguf.py` (0.5 day; large code reuse from existing converter).
-2. MarbleNet end-to-end with golden fixture (2–3 days; small model, mostly preprocessor).
+1. ✅ Write `convert_diarize_to_gguf.py` (done — 179 tensors, 89 MB GGUF).
+2. ⏳ MarbleNet end-to-end:
+   - ✅ Log-mel preprocessor matches NeMo to 4e-5 max abs.
+   - ✅ Encoder (all 6 Jasper blocks) matches NeMo to ~1e-6 in interior (BN
+        uses eps=1e-3, not the PyTorch default 1e-5 — NeMo override).
+   - ⏳ Per-window decoder (AvgPool over 63 frames + Linear(128→2) + softmax).
+   - ⏳ Streaming wrapper: 63-frame audio buffer + per-shift inference.
 3. TitaNet end-to-end with golden fixture (4–6 days; bigger, SE + attention pooling new).
 4. NME-SC clustering with golden fixture (2 days).
 5. Glue + RTTM/transcript output (1–2 days).
