@@ -114,8 +114,16 @@ int main(int argc, char ** argv) {
 
     // Read each block output and compare.
     static const int kBlockChannels[6] = {128, 64, 64, 64, 128, 128};
-    // NeMo zero-pads beyond t_valid (= 520 for our test clip).
+    // NeMo's MaskedConv1d zeroes inputs beyond lens=520 before each conv,
+    // so divergence at t>=520 is expected. We additionally exclude a guard
+    // band of `kReceptiveFieldGuard` frames before that to swallow the
+    // "edge propagation" of subsequent conv kernels (cumulative receptive
+    // field of MarbleNet is ~75 frames worth).
     const int t_valid = 520;
+    const int kReceptiveFieldGuard = 80;
+    const int t_compare = t_valid - kReceptiveFieldGuard;
+    fprintf(stdout, "comparing frames 0..%d (excluding %d-frame guard before "
+            "t_valid=%d edge):\n", t_compare - 1, kReceptiveFieldGuard, t_valid);
     for (int b = 0; b < 6; b++) {
         const int C = kBlockChannels[b];
         std::vector<float> cpp_chan_first(ggml_nelements(g.block_out[b]));
@@ -133,7 +141,7 @@ int main(int argc, char ** argv) {
         char label[64];
         std::snprintf(label, sizeof(label), "block_%d (C=%d)", b, C);
         diff_stats(cpp_row_major.data(), ref.data(), ref.size(),
-                   label, 0, t_valid, C, T);
+                   label, 0, t_compare, C, T);
     }
 
     ggml_gallocr_free(alloc);

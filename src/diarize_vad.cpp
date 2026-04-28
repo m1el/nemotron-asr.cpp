@@ -31,7 +31,9 @@ constexpr block_topology kBlocks[6] = {
     { 1, 1, 1, 128, 128, false, false},
 };
 
-constexpr float kBNEps = 1e-5f;
+// NeMo's Jasper modules build their BN as nn.BatchNorm1d(C, eps=1e-3) (NOT
+// PyTorch's default 1e-5). See jasper.py:_get_conv_bn_layer.
+constexpr float kBNEps = 1e-3f;
 
 ggml_tensor * find(const diarize_model & m, const std::string & name) {
     auto it = m.tensors.find(name);
