@@ -81,9 +81,9 @@ test_python_ref: tests/test_python_reference.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS
 test_preprocessor: tests/test_preprocessor.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Streaming transcribe example
-nemotron-asr.cpp: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+# Streaming transcribe + optional diarization
+nemotron-asr.cpp: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS) $(DIARIZE_SRCS)
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 # Diarization tests
 test_diarize_load: tests/test_diarize_load.cpp $(DIARIZE_SRCS)

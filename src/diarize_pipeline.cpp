@@ -59,14 +59,17 @@ struct diarize_pipeline {
     };
     std::vector<sub_record> subs;
 
-    // Word emissions.
+    // Word emissions. ASR can emit partial subword fragments; we buffer
+    // until whitespace closes a word.
     struct word_record {
         std::string text;
         double      at_sec;
         int         speaker = -1;
     };
     std::vector<word_record> words;
-    size_t json_drained_words = 0;
+    size_t      json_drained_words = 0;
+    std::string word_pending;       // partial word not yet flushed
+    double      word_pending_at = 0;
 
     // Smoothed onset/offset thresholds (NeMo-style asymmetric).
     float thr_onset = 0.9f;
@@ -295,14 +298,26 @@ size_t diarize_pipeline_push_audio(diarize_pipeline * p, const float * audio, si
 void diarize_pipeline_push_text(diarize_pipeline * p, const std::string & text,
                                 double at_sec) {
     if (!p) return;
-    // Split on whitespace; record each whitespace-separated token as a word.
-    std::istringstream iss(text);
-    std::string tok;
-    while (iss >> tok) {
-        diarize_pipeline::word_record w;
-        w.text   = std::move(tok);
-        w.at_sec = at_sec;
-        p->words.push_back(std::move(w));
+    // Streaming ASR emits text in fragments that may split words mid-token
+    // ("ele" then "ven"). Buffer fragments and flush a word only when a
+    // whitespace character closes it. The word's time is the time of its
+    // LAST fragment.
+    auto is_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    for (char c : text) {
+        if (is_ws(c)) {
+            if (!p->word_pending.empty()) {
+                diarize_pipeline::word_record w;
+                w.text   = std::move(p->word_pending);
+                w.at_sec = p->word_pending_at;
+                p->words.push_back(std::move(w));
+                p->word_pending.clear();
+            }
+        } else {
+            p->word_pending.push_back(c);
+            p->word_pending_at = at_sec;
+        }
     }
 }
 
@@ -422,6 +437,15 @@ static int speaker_at(const std::vector<speaker_span> & timeline, double t) {
 std::string diarize_pipeline_finalize(diarize_pipeline * p) {
     if (!p) return "";
     finalize_open_segment(*p);
+
+    // Flush any pending partial word as its own word.
+    if (!p->word_pending.empty()) {
+        diarize_pipeline::word_record w;
+        w.text   = std::move(p->word_pending);
+        w.at_sec = p->word_pending_at;
+        p->words.push_back(std::move(w));
+        p->word_pending.clear();
+    }
 
     if (p->subs.empty()) return "";
 
