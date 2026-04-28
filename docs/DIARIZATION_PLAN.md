@@ -224,13 +224,24 @@ nemotron-asr.cpp/
 
 ## Phasing / order of work
 
-1. ✅ Write `convert_diarize_to_gguf.py` (done — 179 tensors, 89 MB GGUF).
-2. ⏳ MarbleNet end-to-end:
+1. ✅ Write `convert_diarize_to_gguf.py` (179 tensors, 89 MB GGUF).
+2. ✅ MarbleNet end-to-end:
    - ✅ Log-mel preprocessor matches NeMo to 4e-5 max abs.
-   - ✅ Encoder (all 6 Jasper blocks) matches NeMo to ~1e-6 in interior (BN
-        uses eps=1e-3, not the PyTorch default 1e-5 — NeMo override).
-   - ⏳ Per-window decoder (AvgPool over 63 frames + Linear(128→2) + softmax).
-   - ⏳ Streaming wrapper: 63-frame audio buffer + per-shift inference.
+   - ✅ Encoder (all 6 Jasper blocks) matches NeMo to ~1e-6 (BN eps=1e-3
+        Jasper override, not the PyTorch default).
+   - ✅ MaskedConv1d zero-fill — full T match including padded frames.
+   - ✅ Per-chunk decoder (AdaptiveAvgPool + Linear + softmax) bit-exact
+        with NeMo on 458 chunks of the test audio.
+   - ✅ vad_session API + segment extraction.
+3. ✅ TitaNet-L speaker encoder:
+   - ✅ Per-feature normalize fixed (mean/std over t_valid frames, not padded).
+   - ✅ All 5 Jasper+SE blocks match to 0 max_abs.
+   - ✅ Attentive pool + emb conv match.
+   - ✅ Final 192-d embedding: cosine 1.000 with NeMo, norms identical.
+   - Bug log: SE goes inside mconv before mout; decoder BN uses default
+     eps=1e-5 (TDNNModule and SpeakerDecoder.affine_layer), NOT 1e-3.
+4. ⏳ NME-SC clustering (next).
+5. ⏳ Glue: VAD → subseg → embed → cluster → align → RTTM.
 3. TitaNet end-to-end with golden fixture (4–6 days; bigger, SE + attention pooling new).
 4. NME-SC clustering with golden fixture (2 days).
 5. Glue + RTTM/transcript output (1–2 days).
