@@ -40,7 +40,7 @@ endif
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
 GGML_STREAM_SRCS = src/nemo-stream.cpp
-DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp
+DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp src/diarize_vad.cpp
 
 # Original implementation (for comparison tests)
 ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/conv_subsampling.cpp src/reference/conformer_modules.cpp src/reference/conformer_encoder.cpp src/reference/rnnt_decoder.cpp src/reference/rnnt_joint.cpp src/reference/greedy_decode.cpp src/reference/tokenizer.cpp
@@ -89,6 +89,9 @@ test_diarize_load: tests/test_diarize_load.cpp $(DIARIZE_SRCS)
 	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_preproc: tests/test_diarize_preproc.cpp $(DIARIZE_SRCS)
+	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+
+test_diarize_vad: tests/test_diarize_vad.cpp $(DIARIZE_SRCS)
 	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
 
 clean:
