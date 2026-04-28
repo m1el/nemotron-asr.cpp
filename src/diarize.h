@@ -68,9 +68,20 @@ struct diarize_model {
     std::map<std::string, ggml_tensor *> tensors;
 };
 
+// Backend selection for the diarize model. AUTO prefers CUDA → Metal → CPU.
+enum class diarize_backend {
+    CPU,
+    CUDA,
+    METAL,
+    AUTO,
+};
+
 // Load a diarize.gguf into the model. Returns true on success.
-// Uses CPU backend by default (the diarize subnets are tiny; CUDA gives no win).
-bool diarize_model_load(const std::string & path, diarize_model & model);
+// Default backend is CPU because several test binaries dereference
+// tensor->data directly (which is only valid for CPU). The integrated
+// pipeline passes AUTO/CUDA/Metal explicitly.
+bool diarize_model_load(const std::string & path, diarize_model & model,
+                        diarize_backend backend = diarize_backend::CPU);
 
 void diarize_model_free(diarize_model & model);
 

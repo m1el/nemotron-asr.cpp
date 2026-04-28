@@ -374,9 +374,10 @@ struct vad_session {
     int n_classes  = 2;
     int enc_c      = 128;
 
-    // Borrowed pointers to the preprocessor weights inside the gguf-backed buffer.
-    const float * fb     = nullptr;
-    const float * window = nullptr;
+    // Host copies of the preprocessor weights so we can read them on CPU
+    // regardless of which backend the model lives on.
+    std::vector<float> fb_host;
+    std::vector<float> win_host;
 
     diarize_audio_cfg pp_cfg;
 
@@ -404,8 +405,10 @@ vad_session * vad_session_init(diarize_model & m, const vad_weights & w) {
     auto * fb_t  = diarize_model_get_tensor(m, "vad.preprocessor.featurizer.fb");
     auto * win_t = diarize_model_get_tensor(m, "vad.preprocessor.featurizer.window");
     GGML_ASSERT(fb_t && win_t);
-    s->fb     = static_cast<const float *>(fb_t->data);
-    s->window = static_cast<const float *>(win_t->data);
+    s->fb_host.resize(ggml_nelements(fb_t));
+    s->win_host.resize(ggml_nelements(win_t));
+    ggml_backend_tensor_get(fb_t,  s->fb_host.data(),  0, s->fb_host.size()  * sizeof(float));
+    ggml_backend_tensor_get(win_t, s->win_host.data(), 0, s->win_host.size() * sizeof(float));
 
     s->mel_chan.resize((size_t)kVadNMels * kVadMelPadded);
     s->enc_buf.resize((size_t)s->enc_c * kVadMelPadded);
@@ -435,7 +438,8 @@ float vad_session_run_chunk(vad_session * s, const float * audio, int lens_sampl
     // expected to zero-pad if the audio is shorter).
     size_t t_valid = 0;
     size_t t_padded = diarize_compute_logmel(audio, kVadWindowSamples, s->pp_cfg,
-                                             s->fb, s->window, s->mel_pp, &t_valid);
+                                             s->fb_host.data(), s->win_host.data(),
+                                             s->mel_pp, &t_valid);
     GGML_ASSERT((int)t_padded == kVadMelPadded);
     GGML_ASSERT((int)t_valid  == kVadMelValid);
     (void)t_padded; (void)t_valid;

@@ -563,8 +563,8 @@ struct spk_session {
     spk_graph graph;
     ggml_gallocr_t alloc = nullptr;
 
-    const float * fb = nullptr;
-    const float * window = nullptr;
+    std::vector<float> fb_host;
+    std::vector<float> win_host;
     diarize_audio_cfg pp_cfg;
 
     std::vector<float> mel_pp;
@@ -581,8 +581,10 @@ spk_session * spk_session_init(diarize_model & m, const spk_weights & w) {
     auto * fb_t  = diarize_model_get_tensor(m, "spk.preprocessor.featurizer.fb");
     auto * win_t = diarize_model_get_tensor(m, "spk.preprocessor.featurizer.window");
     GGML_ASSERT(fb_t && win_t);
-    s->fb     = static_cast<const float *>(fb_t->data);
-    s->window = static_cast<const float *>(win_t->data);
+    s->fb_host.resize(ggml_nelements(fb_t));
+    s->win_host.resize(ggml_nelements(win_t));
+    ggml_backend_tensor_get(fb_t,  s->fb_host.data(),  0, s->fb_host.size()  * sizeof(float));
+    ggml_backend_tensor_get(win_t, s->win_host.data(), 0, s->win_host.size() * sizeof(float));
 
     s->pp_cfg.per_feature_normalize = true;
     s->mel_chan.resize((size_t)kSpkNMels * kSpkMelPadded);
@@ -600,7 +602,8 @@ bool spk_session_run_chunk(spk_session * s, const float * audio,
                            int lens_samples, float * out_emb) {
     size_t t_valid = 0, t_padded = 0;
     t_padded = diarize_compute_logmel(audio, kSpkSubsegSamples, s->pp_cfg,
-                                      s->fb, s->window, s->mel_pp, &t_valid);
+                                      s->fb_host.data(), s->win_host.data(),
+                                      s->mel_pp, &t_valid);
     if ((int)t_padded != kSpkMelPadded || (int)t_valid != kSpkMelValid) {
         fprintf(stderr, "spk_session: unexpected mel shape t_valid=%zu t_padded=%zu\n",
                 t_valid, t_padded);

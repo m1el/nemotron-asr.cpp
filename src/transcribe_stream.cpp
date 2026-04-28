@@ -140,6 +140,13 @@ int main(int argc, char ** argv) {
         dcfg.speaker_text_path = speaker_text_path.empty() && !diarize_gguf.empty()
             ? "-"
             : speaker_text_path;
+        // Mirror ASR's backend choice: CUDA/Metal if requested or available.
+        switch (backend) {
+            case NEMO_BACKEND_CPU:   dcfg.backend = diarize_backend::CPU;   break;
+            case NEMO_BACKEND_CUDA:  dcfg.backend = diarize_backend::CUDA;  break;
+            case NEMO_BACKEND_METAL: dcfg.backend = diarize_backend::METAL; break;
+            default:                 dcfg.backend = diarize_backend::AUTO;  break;
+        }
         dp = diarize_pipeline_init(dcfg);
         if (!dp) {
             fprintf(stderr, "Failed to init diarization pipeline\n");

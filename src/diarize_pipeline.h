@@ -27,7 +27,8 @@
 #include "diarize_cluster.h"
 
 struct diarize_pipeline_cfg {
-    std::string diarize_gguf_path;
+    std::string     diarize_gguf_path;
+    diarize_backend backend = diarize_backend::AUTO;
 
     // Sub-segment cadence.
     float sub_window_sec = 1.5f;

@@ -87,7 +87,7 @@ diarize_pipeline * diarize_pipeline_init(const diarize_pipeline_cfg & cfg) {
     p->thr_onset       = cfg.vad_post.onset;
     p->thr_offset      = cfg.vad_post.offset;
     p->min_off_frames  = (int)std::ceil(cfg.vad_post.min_duration_off / cfg.vad_post.frame_period_sec);
-    if (!diarize_model_load(cfg.diarize_gguf_path, p->model)) {
+    if (!diarize_model_load(cfg.diarize_gguf_path, p->model, cfg.backend)) {
         fprintf(stderr, "diarize_pipeline: failed to load %s\n", cfg.diarize_gguf_path.c_str());
         delete p;
         return nullptr;

@@ -10,6 +10,12 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 
 // ---------------------------------------------------------------------------
 // KV helpers
@@ -47,12 +53,39 @@ static void load_audio_hparams(gguf_context * c, const char * prefix,
 // Model loading
 // ---------------------------------------------------------------------------
 
-bool diarize_model_load(const std::string & path, diarize_model & model) {
-    // CPU only for the diarization subnets; they are small and CPU keeps the
-    // streaming hot-path off the GPU.
-    model.backend = ggml_backend_cpu_init();
+static ggml_backend_t init_backend_for(diarize_backend choice) {
+    auto try_cuda = []() -> ggml_backend_t {
+#ifdef GGML_USE_CUDA
+        if (ggml_backend_cuda_get_device_count() > 0) {
+            return ggml_backend_cuda_init(0);
+        }
+#endif
+        return nullptr;
+    };
+    auto try_metal = []() -> ggml_backend_t {
+#ifdef GGML_USE_METAL
+        return ggml_backend_metal_init();
+#endif
+        return nullptr;
+    };
+    switch (choice) {
+        case diarize_backend::CPU:   return ggml_backend_cpu_init();
+        case diarize_backend::CUDA:  return try_cuda();
+        case diarize_backend::METAL: return try_metal();
+        case diarize_backend::AUTO:
+            if (auto * b = try_cuda())  return b;
+            if (auto * b = try_metal()) return b;
+            return ggml_backend_cpu_init();
+    }
+    return ggml_backend_cpu_init();
+}
+
+bool diarize_model_load(const std::string & path, diarize_model & model,
+                        diarize_backend backend) {
+    model.backend = init_backend_for(backend);
     if (!model.backend) {
-        fprintf(stderr, "diarize_model_load: failed to init CPU backend\n");
+        fprintf(stderr, "diarize_model_load: failed to init backend (choice=%d)\n",
+                (int)backend);
         return false;
     }
 
