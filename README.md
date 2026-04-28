@@ -29,6 +29,44 @@ Notice: the weights are [Licensed by NVIDIA Corporation under the NVIDIA Open Mo
 
 Or converted from https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b using [convert_to_gguf.py](scripts/convert_to_gguf.py)
 
+## Speaker diarization (optional)
+
+If you also want speaker labels in the output, build a separate
+`diarize.gguf` from MarbleNet (VAD) + TitaNet-L (speaker embeddings):
+
+```bash
+uv run scripts/convert_diarize_to_gguf.py weights/diarize.gguf
+```
+
+(This downloads `vad_multilingual_marblenet` and `titanet_large` from NeMo's
+pretrained registry on first run.)
+
+Then run with the `--diarize` flag:
+
+```bash
+ffmpeg -hide_banner -loglevel error -i your-file.mp3 -ar 16000 -ac 1 -f s16le - \
+  | ./nemotron-asr.cpp weights/nemotron-speech-streaming-0.6B-v0.1.Q8_0.gguf - 80 0 \
+        --diarize weights/diarize.gguf \
+        --num-speakers 2 \
+        --rttm out.rttm \
+        --speaker-text out.spk.txt
+```
+
+Flags:
+
+- `--diarize <gguf>`     enable diarization (~89 MB extra GGUF)
+- `--num-speakers K`     force K speakers; otherwise NME-SC estimates
+- `--sub-shift sec`      sub-segment shift, default 0.75 s
+- `--rttm <path>`        write RTTM-format output for evaluation
+- `--speaker-text <path>` write the speaker-tagged transcript at EOF
+                          (defaults to stdout when `--diarize` is set)
+- `--json <path>`        per-word JSON lines emitted as the audio streams
+
+The diarization side runs alongside ASR: VAD on each 0.63 s window as the
+audio arrives, embedding each 1.5 s sub-segment immediately, audio dropped
+behind the cursor. Clustering runs once at end-of-input. See
+[docs/DIARIZATION_PLAN.md](docs/DIARIZATION_PLAN.md) for design notes.
+
 ## Model weight differences from NeMo
 
 The original tensors in the `nvidia/nemotron-speech-streaming-en-0.6b` require transposition to be used in matrix multiplication in ggml.

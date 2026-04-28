@@ -240,8 +240,30 @@ nemotron-asr.cpp/
    - ✅ Final 192-d embedding: cosine 1.000 with NeMo, norms identical.
    - Bug log: SE goes inside mconv before mout; decoder BN uses default
      eps=1e-5 (TDNNModule and SpeakerDecoder.affine_layer), NOT 1e-3.
-4. ⏳ NME-SC clustering (next).
-5. ⏳ Glue: VAD → subseg → embed → cluster → align → RTTM.
+4. ✅ NME-SC clustering (Eigen): cosine affinity, k-NN binarize, NME score
+   sweep, eigengap-based speaker count, k-means++. Bit-exact affinity and
+   p_hat against NeMo on synthetic fixtures; 100% label match.
+5. ✅ Glue layer (`src/diarize_pipeline.{h,cpp}`):
+   - Streaming VAD with onset/offset state machine.
+   - Sub-segment cursor inside each open speech region.
+   - On-the-fly TitaNet embedding; audio dropped behind the cursor.
+   - Word fragments buffered until whitespace closes a word.
+   - On EOF: NME-SC, build per-second speaker timeline, assign each word
+     by binary searching the timeline at its emission time.
+6. ✅ Integrated into `nemotron-asr.cpp` (single binary): same audio stream
+   feeds ASR + diarization; live transcript prints as it goes; the
+   speaker-tagged transcript is emitted at EOF.
+
+## Known limitations / future work
+
+- Single-scale clustering only. The tutorial's full path is multi-scale (6
+  scales averaged into the affinity matrix) — port outstanding. Single-scale
+  works for clear 2-speaker audio but undercounts on short clips
+  (`min_samples_for_nmesc=6`) and is less robust than multi-scale.
+- `--num-speakers` is currently a useful escape hatch for clips below the
+  NME analysis floor.
+- Words past the last sub-segment's `end_sec` get `spk_-1`; could extend
+  the timeline by clamping forward instead.
 3. TitaNet end-to-end with golden fixture (4–6 days; bigger, SE + attention pooling new).
 4. NME-SC clustering with golden fixture (2 days).
 5. Glue + RTTM/transcript output (1–2 days).
