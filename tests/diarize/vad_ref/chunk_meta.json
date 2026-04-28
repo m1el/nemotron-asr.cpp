@@ -1,0 +1,20 @@
+{
+  "n_chunks": 458,
+  "window_samples": 10080,
+  "shift_samples": 160,
+  "sample_rate": 16000,
+  "audio_samples": 83200,
+  "shapes": {
+    "chunk_logits": [
+      458,
+      2
+    ],
+    "chunk_probs": [
+      458,
+      2
+    ],
+    "chunk_speech": [
+      458
+    ]
+  }
+}
