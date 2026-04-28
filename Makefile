@@ -40,7 +40,8 @@ endif
 # Source files
 GGML_SRCS = src/nemo-ggml.cpp src/preprocessor.cpp
 GGML_STREAM_SRCS = src/nemo-stream.cpp
-DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp src/diarize_vad.cpp src/diarize_spk.cpp
+DIARIZE_SRCS = src/diarize.cpp src/diarize_audio.cpp src/diarize_vad.cpp src/diarize_spk.cpp src/diarize_cluster.cpp
+DIARIZE_INCLUDES = -I vendor/eigen
 
 # Original implementation (for comparison tests)
 ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/conv_subsampling.cpp src/reference/conformer_modules.cpp src/reference/conformer_encoder.cpp src/reference/rnnt_decoder.cpp src/reference/rnnt_joint.cpp src/reference/greedy_decode.cpp src/reference/tokenizer.cpp
@@ -86,25 +87,28 @@ nemotron-asr.cpp: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 
 # Diarization tests
 test_diarize_load: tests/test_diarize_load.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_preproc: tests/test_diarize_preproc.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_vad: tests/test_diarize_vad.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_block0: tests/test_diarize_block0.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_chunks: tests/test_diarize_chunks.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_session: tests/test_diarize_session.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 test_diarize_spk: tests/test_diarize_spk.cpp $(DIARIZE_SRCS)
-	$(CXX) $(CXXFLAGS) -I src $^ $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
+
+test_diarize_cluster: tests/test_diarize_cluster.cpp $(DIARIZE_SRCS)
+	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
 clean:
 	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor
