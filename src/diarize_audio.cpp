@@ -174,29 +174,41 @@ size_t diarize_compute_logmel(
         }
     }
 
-    // Per-feature normalize: subtract per-mel mean, divide by per-mel std (over t).
+    // NeMo's effective valid-frame count is n_samples / hop (without the +1 that
+    // torch.stft(center=True) adds). The trailing extra STFT frame is zeroed out
+    // along with the pad-to-16 padding.
+    const int t_valid = (int)n_samples / cfg.hop_size;
+
+    // Per-feature normalize over the t_valid frames only (NeMo uses seq_len, not
+    // the +1 STFT frame; std uses Bessel's correction with n=t_valid-1).
     if (cfg.per_feature_normalize) {
+        const int n_eff = t_valid;
+        const int denom_std = std::max(1, n_eff - 1);
         for (int m = 0; m < cfg.n_mels; m++) {
             float * row = mel.data() + (size_t)m * (size_t)n_frames;
             double sum = 0.0;
-            for (int t = 0; t < n_frames; t++) sum += row[t];
-            float mean = (float)(sum / n_frames);
+            for (int t = 0; t < n_eff; t++) sum += row[t];
+            float mean = (float)(sum / n_eff);
             double var = 0.0;
-            for (int t = 0; t < n_frames; t++) {
+            for (int t = 0; t < n_eff; t++) {
                 float d = row[t] - mean;
                 var += (double)d * d;
             }
-            // NeMo uses unbiased variance (Bessel's correction).
-            float std_v = std::sqrt((float)(var / std::max(1, n_frames - 1)));
-            float inv_std = 1.0f / (std_v + 1e-5f);
-            for (int t = 0; t < n_frames; t++) row[t] = (row[t] - mean) * inv_std;
+            float std_v = std::sqrt((float)(var / denom_std)) + 1e-5f;
+            float inv_std = 1.0f / std_v;
+            for (int t = 0; t < n_eff; t++) row[t] = (row[t] - mean) * inv_std;
+            // Zero the +1 STFT frame and any other beyond t_valid.
+            for (int t = n_eff; t < n_frames; t++) row[t] = 0.0f;
+        }
+    } else {
+        // Even without normalization, NeMo masks frames beyond t_valid to 0 before
+        // pad_to_16. (The MarbleNet path; relied on by the encoder MaskedConv1d.)
+        for (int m = 0; m < cfg.n_mels; m++) {
+            float * row = mel.data() + (size_t)m * (size_t)n_frames;
+            for (int t = t_valid; t < n_frames; t++) row[t] = 0.0f;
         }
     }
 
-    // NeMo's effective valid-frame count is n_samples / hop (without the +1 that
-    // torch.stft(center=True) adds). The trailing extra frame computed by the
-    // FFT is zeroed out as part of the pad-to-16 step.
-    int t_valid = (int)n_samples / cfg.hop_size;
     int t_padded = t_valid;
     if (cfg.pad_to > 1) {
         int rem = t_valid % cfg.pad_to;
