@@ -110,20 +110,17 @@ int main(int argc, char ** argv) {
     vad_graph g = vad_graph_build(w, T, n_mels);
 
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!vad_graph_compute(g, m.backend, alloc, mel_in.data())) return 4;
+    // Match NeMo: lens=520 (valid frames before pad-to-16), so frames 520..527
+    // are zero-fill that gets masked out before each conv.
+    const int lens = 520;
+    if (!vad_graph_compute(g, m.backend, alloc, mel_in.data(), lens)) return 4;
 
-    // Read each block output and compare.
+    // Read each block output and compare. With masking enabled, the entire
+    // T_padded output (including frames 520..527) should match NeMo's fixture.
     static const int kBlockChannels[6] = {128, 64, 64, 64, 128, 128};
-    // NeMo's MaskedConv1d zeroes inputs beyond lens=520 before each conv,
-    // so divergence at t>=520 is expected. We additionally exclude a guard
-    // band of `kReceptiveFieldGuard` frames before that to swallow the
-    // "edge propagation" of subsequent conv kernels (cumulative receptive
-    // field of MarbleNet is ~75 frames worth).
-    const int t_valid = 520;
-    const int kReceptiveFieldGuard = 80;
-    const int t_compare = t_valid - kReceptiveFieldGuard;
-    fprintf(stdout, "comparing frames 0..%d (excluding %d-frame guard before "
-            "t_valid=%d edge):\n", t_compare - 1, kReceptiveFieldGuard, t_valid);
+    const int t_compare = T;
+    fprintf(stdout, "comparing all %d frames (lens=%d, masking ON):\n",
+            t_compare, lens);
     for (int b = 0; b < 6; b++) {
         const int C = kBlockChannels[b];
         std::vector<float> cpp_chan_first(ggml_nelements(g.block_out[b]));

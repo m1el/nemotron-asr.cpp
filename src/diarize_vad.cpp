@@ -262,14 +262,6 @@ ggml_tensor * apply_bn(ggml_context * ctx, ggml_tensor * x,
     return y;
 }
 
-ggml_tensor * apply_subconv(ggml_context * ctx, ggml_tensor * x, const vad_subconv & s) {
-    ggml_tensor * y = x;
-    if (s.separable) y = depthwise_same(ctx, y, s.dw_w, s.kernel, s.dilation);
-    y = pointwise(ctx, y, s.pw_w);
-    y = apply_bn(ctx, y, s.bn_scale, s.bn_bias);
-    return y;
-}
-
 } // namespace
 
 vad_graph vad_graph_build(const vad_weights & w, int T, int n_mels) {
@@ -277,7 +269,6 @@ vad_graph vad_graph_build(const vad_weights & w, int T, int n_mels) {
     g.T = T;
     g.n_mels = n_mels;
 
-    // 2 MiB of metadata is plenty for 6 blocks × tens of nodes.
     ggml_init_params p = { .mem_size = 2 * 1024 * 1024, .mem_buffer = nullptr, .no_alloc = true };
     g.ctx = ggml_init(p);
     g.graph = ggml_new_graph_custom(g.ctx, /*size=*/8192, /*grads=*/false);
@@ -286,17 +277,40 @@ vad_graph vad_graph_build(const vad_weights & w, int T, int n_mels) {
     ggml_set_name(g.mel_input, "mel_input");
     ggml_set_input(g.mel_input);
 
+    // Per-time mask broadcast over channels. Matches NeMo's MaskedConv1d:
+    // before every conv, input positions [lens, T) are zeroed out.
+    g.mask_input = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, 1, T);
+    ggml_set_name(g.mask_input, "mask_input");
+    ggml_set_input(g.mask_input);
+
+    auto apply_mask = [&](ggml_tensor * x) -> ggml_tensor * {
+        return ggml_mul(g.ctx, x, g.mask_input);
+    };
+
+    auto apply_subconv_masked = [&](ggml_tensor * x, const vad_subconv & s) -> ggml_tensor * {
+        ggml_tensor * y = x;
+        if (s.separable) {
+            y = apply_mask(y);
+            y = depthwise_same(g.ctx, y, s.dw_w, s.kernel, s.dilation);
+        }
+        y = apply_mask(y);
+        y = pointwise(g.ctx, y, s.pw_w);
+        y = apply_bn(g.ctx, y, s.bn_scale, s.bn_bias);
+        return y;
+    };
+
     ggml_tensor * cur = g.mel_input;
     g.block_out.resize(6);
     for (int b = 0; b < 6; b++) {
         const vad_block & blk = w.blocks[b];
         ggml_tensor * x_in = cur;
         for (size_t s = 0; s < blk.subs.size(); s++) {
-            cur = apply_subconv(g.ctx, cur, blk.subs[s]);
+            cur = apply_subconv_masked(cur, blk.subs[s]);
             if (s + 1 < blk.subs.size()) cur = ggml_relu(g.ctx, cur);
         }
         if (blk.residual) {
-            ggml_tensor * r = pointwise(g.ctx, x_in, blk.res.pw_w);
+            ggml_tensor * r = apply_mask(x_in);
+            r = pointwise(g.ctx, r, blk.res.pw_w);
             r = apply_bn(g.ctx, r, blk.res.bn_scale, blk.res.bn_bias);
             cur = ggml_add(g.ctx, cur, r);
         }
@@ -312,12 +326,19 @@ vad_graph vad_graph_build(const vad_weights & w, int T, int n_mels) {
 }
 
 bool vad_graph_compute(vad_graph & g, ggml_backend_t backend, ggml_gallocr_t alloc,
-                       const float * mel_data) {
+                       const float * mel_data, int lens) {
     if (!ggml_gallocr_alloc_graph(alloc, g.graph)) {
         fprintf(stderr, "vad_graph_compute: gallocr_alloc_graph failed\n");
         return false;
     }
     ggml_backend_tensor_set(g.mel_input, mel_data, 0, ggml_nbytes(g.mel_input));
+
+    // Build the per-time mask: 1.0 for t<lens, 0.0 otherwise.
+    std::vector<float> mask((size_t)g.T, 0.0f);
+    const int lens_clamped = (lens < 0) ? 0 : (lens > g.T ? g.T : lens);
+    for (int t = 0; t < lens_clamped; t++) mask[t] = 1.0f;
+    ggml_backend_tensor_set(g.mask_input, mask.data(), 0, mask.size() * sizeof(float));
+
     ggml_status st = ggml_backend_graph_compute(backend, g.graph);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vad_graph_compute: graph_compute returned %d\n", (int)st);

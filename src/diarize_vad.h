@@ -59,6 +59,7 @@ struct vad_graph {
     ggml_context * ctx = nullptr;
     ggml_cgraph  * graph = nullptr;
     ggml_tensor  * mel_input = nullptr;
+    ggml_tensor  * mask_input = nullptr;           // ne=(1, T): 1.0 for t<lens else 0.0
     std::vector<ggml_tensor *> block_out;
     ggml_tensor  * encoder_out = nullptr;
     int T = 0;
@@ -67,11 +68,15 @@ struct vad_graph {
 
 vad_graph vad_graph_build(const vad_weights & w, int T, int n_mels = 80);
 
+// Compute the encoder. `lens` is the number of valid mel frames; positions
+// [lens, T) are zeroed before each MaskedConv1d, matching NeMo's protocol.
+// Pass lens=T to disable masking (steady-state streaming).
 bool vad_graph_compute(
     vad_graph & g,
     ggml_backend_t backend,
     ggml_gallocr_t alloc,
-    const float * mel_data);  // (n_mels, T) channels-innermost layout
+    const float * mel_data,  // (n_mels, T) channels-innermost layout
+    int lens);
 
 void vad_graph_free(vad_graph & g);
 

@@ -165,6 +165,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "compute failed\n");
         return 5;
     }
+    // Note: this micro-graph does NOT mask. Block 0's bisection runs are
+    // expected to diverge slightly near t=520 (vs the masked fixture); we
+    // limit the diff window below.
 
     auto dump = [&](ggml_tensor * t) {
         std::vector<float> v(ggml_nelements(t));
