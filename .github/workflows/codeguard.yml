@@ -10,6 +10,7 @@ permissions:
 jobs:
   codeguard:
     name: GuardSpine CodeGuard
+    environment: codeguard-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +20,10 @@ jobs:
       - uses: DNYoussef/codeguard-action@v1
         with:
           risk_threshold: L3
-          rubric: default
+          rubric: .codeguard/rubrics/clarity-mine.yaml
+          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          openrouter_model: anthropic/claude-opus-4.6
+          ai_review: "true"
           github_token: ${{ github.token }}
           guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
           guardspine_api_url: https://backend-production-0f5d.up.railway.app/api/v1
