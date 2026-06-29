@@ -1,27 +1,12 @@
+# .github/workflows/codeguard.yml
 name: CodeGuard Governance
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-permissions:
-  contents: read
-  pull-requests: write
+on: [pull_request]
 
 jobs:
   codeguard:
-    name: GuardSpine CodeGuard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: DNYoussef/codeguard-action@v1
         with:
-          risk_threshold: L3
-          rubric: default
-          github_token: ${{ github.token }}
           guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
-          guardspine_api_url: https://backend-production-0f5d.up.railway.app/api/v1
-          post_comment: "true"
-          generate_bundle: "true"
