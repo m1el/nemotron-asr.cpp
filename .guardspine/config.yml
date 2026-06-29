@@ -1,8 +1,8 @@
 # GuardSpine CodeGuard Configuration
 # Generated during onboarding
 
-api_url: https://backend-production-0f5d.up.railway.app/api/v1
-project_id: proj-6f3ab4e6183d
+api_url: https://api.guardspine.ai/api/v1
+project_id: proj-252b419d4115
 
 rubric_packs:
   - security-baseline
