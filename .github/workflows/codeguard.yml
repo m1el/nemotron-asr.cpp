@@ -10,3 +10,6 @@ jobs:
       - uses: DNYoussef/codeguard-action@v1
         with:
           guardspine_api_key: ${{ secrets.GUARDSPINE_API_KEY }}
+          guardspine_api_url: https://api.guardspine.ai/api/v1
+          post_comment: "true"
+          generate_bundle: "true"
