@@ -31,60 +31,60 @@ static void compute_pos_emb(float * data, int max_len, int d_model) {
     }
 }
 
-// Initialize backend based on requested type
-static bool init_backend(nemo_model & model, nemo_backend_type backend_type) {
+// Initialize backend based on requested name (using dynamic backend loading)
+// backend_name: specific backend to use (e.g., "CPU", "CUDA", "Vulkan", "Metal")
+// If nullptr, uses the first available backend (highest priority)
+static bool init_backend(nemo_model & model, const char * backend_name) {
     model.backend = nullptr;
-    model.backend_type = NEMO_BACKEND_CPU;  // default
+    model.backend_name = "";
 
-#ifdef GGML_USE_METAL
-    if (backend_type == NEMO_BACKEND_METAL || backend_type == NEMO_BACKEND_AUTO) {
-        model.backend = ggml_backend_metal_init();
+    // Load all available backend modules
+    ggml_backend_load_all();
+
+    if (backend_name != nullptr && backend_name[0] != '\0') {
+        // User specified a backend
+        model.backend = ggml_backend_init_by_name(backend_name, nullptr);
         if (!model.backend) {
-            fprintf(stderr, "Failed to initialize Metal backend\n");
-            assert(false);
-        }
-    }
-#endif
-
-#ifdef GGML_USE_CUDA
-    if (backend_type == NEMO_BACKEND_CUDA || backend_type == NEMO_BACKEND_AUTO) {
-        int n_devices = ggml_backend_cuda_get_device_count();
-        if (n_devices > 0) {
-            model.backend = ggml_backend_cuda_init(0);  // use first CUDA device
-            if (model.backend) {
-                model.backend_type = NEMO_BACKEND_CUDA;
-                char desc[256];
-                ggml_backend_cuda_get_device_description(0, desc, sizeof(desc));
-                printf("%s: using CUDA backend (%s)\n", __func__, desc);
-
-                size_t free_mem, total_mem;
-                ggml_backend_cuda_get_device_memory(0, &free_mem, &total_mem);
-                printf("%s: CUDA memory: %.1f / %.1f GB available\n", __func__,
-                       free_mem / 1e9, total_mem / 1e9);
-            }
-        }
-    }
-#endif
-
-    // Fall back to CPU if CUDA not available or not requested
-    if (!model.backend) {
-        if (backend_type == NEMO_BACKEND_CUDA) {
-            fprintf(stderr, "%s: CUDA backend requested but not available\n", __func__);
+            fprintf(stderr, "%s: failed to initialize %s backend\n", __func__, backend_name);
             return false;
         }
-        model.backend = ggml_backend_cpu_init();
-        model.backend_type = NEMO_BACKEND_CPU;
-        printf("%s: using CPU backend\n", __func__);
+        model.backend_name = backend_name;
+        printf("%s: using %s backend\n", __func__, backend_name);
+    } else {
+        // Auto-select: use first available backend (backends are registered in priority order)
+        size_t dev_count = ggml_backend_dev_count();
+        if (dev_count == 0) {
+            fprintf(stderr, "%s: no backends available\n", __func__);
+            return false;
+        }
+
+        // Try devices in order until one initializes successfully
+        for (size_t i = 0; i < dev_count; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const char * dev_name = ggml_backend_dev_name(dev);
+
+            model.backend = ggml_backend_dev_init(dev, nullptr);
+            if (model.backend) {
+                model.backend_name = dev_name;
+                printf("%s: using %s backend (auto-selected)\n", __func__, dev_name);
+                break;
+            }
+        }
+
+        if (!model.backend) {
+            fprintf(stderr, "%s: failed to initialize any backend\n", __func__);
+            return false;
+        }
     }
 
-    return model.backend != nullptr;
+    return true;
 }
 
-bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_type backend_type) {
+bool nemo_model_load(const std::string & path, nemo_model & model, const char * backend_name) {
     // printf("%s: loading model from '%s'\n", __func__, path.c_str());
 
     // Initialize backend
-    if (!init_backend(model, backend_type)) {
+    if (!init_backend(model, backend_name)) {
         fprintf(stderr, "%s: failed to initialize backend\n", __func__);
         return false;
     }
@@ -388,13 +388,13 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
 }
 
 struct nemo_context * nemo_init(const char * model_path) {
-    return nemo_init_with_backend(model_path, NEMO_BACKEND_AUTO);
+    return nemo_init_with_backend(model_path, nullptr);
 }
 
-struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backend_type backend) {
+struct nemo_context * nemo_init_with_backend(const char * model_path, const char * backend_name) {
     struct nemo_context * ctx = new nemo_context();
 
-    if (!nemo_model_load(model_path, ctx->model, backend)) {
+    if (!nemo_model_load(model_path, ctx->model, backend_name)) {
         delete ctx;
         return nullptr;
     }
@@ -433,12 +433,8 @@ struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backe
 }
 
 const char * nemo_get_backend_name(struct nemo_context * ctx) {
-    if (!ctx) return "unknown";
-    switch (ctx->model.backend_type) {
-        case NEMO_BACKEND_CUDA: return "CUDA";
-        case NEMO_BACKEND_CPU:  return "CPU";
-        default: return "unknown";
-    }
+    if (!ctx || ctx->model.backend_name.empty()) return "unknown";
+    return ctx->model.backend_name.c_str();
 }
 
 void nemo_free(struct nemo_context * ctx) {

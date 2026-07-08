@@ -14,6 +14,79 @@ std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<ch
 // nemo_decoder_state::init and reset are now inline in nemo-ggml.h
 
 // =============================================================================
+// C-compatible nemo_cache_config helper functions
+// =============================================================================
+
+extern "C" {
+
+size_t nemo_cache_config_get_chunk_mel_frames(const nemo_cache_config* config) {
+    if (!config) return 0;
+    // NeMo formula: sampling_frames[1] + subsampling_factor * lookahead_steps
+    // where lookahead_steps = att_right_context
+    // Plus pre_encode_cache_size for the overlap
+    int32_t lookahead_steps = config->att_right_context;
+    int32_t chunk_without_cache = config->subsampling_factor + config->subsampling_factor * lookahead_steps;
+    return config->pre_encode_cache_size + chunk_without_cache;
+}
+
+size_t nemo_cache_config_get_shift_mel_frames_val(const nemo_cache_config* config) {
+    if (!config) return 0;
+    // NeMo formula: shift_size[1] = sampling_frames[1] + sampling_frames[1] * (lookahead_steps - cache_drop_size)
+    // For pure causal with cache_drop_size=0: 8 + 8*0 = 8
+    int32_t lookahead_steps = config->att_right_context;
+    return config->subsampling_factor + config->subsampling_factor * (lookahead_steps - config->cache_drop_size);
+}
+
+int32_t nemo_cache_config_get_chunk_samples(const nemo_cache_config* config) {
+    if (!config) return 0;
+    return nemo_cache_config_get_chunk_mel_frames(config) * config->hop_length;
+}
+
+int32_t nemo_cache_config_get_latency_ms(const nemo_cache_config* config) {
+    if (!config) return 0;
+    return nemo_cache_config_get_chunk_mel_frames(config) * config->hop_length * 1000 / config->sample_rate;
+}
+
+int32_t nemo_cache_config_get_valid_out_len(const nemo_cache_config* config) {
+    if (!config) return 0;
+    return 1 + config->att_right_context;
+}
+
+nemo_cache_config nemo_cache_config_default(void) {
+    return nemo_cache_config_with_latency(NEMO_LATENCY_PURE_CAUSAL);
+}
+
+nemo_cache_config nemo_cache_config_with_latency(nemo_latency_mode mode) {
+    nemo_cache_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    // Set defaults
+    cfg.att_left_context = 70;
+    cfg.att_right_context = static_cast<int32_t>(mode);
+    cfg.cache_drop_size = 0;
+    cfg.conv_kernel_size = 9;
+    cfg.conv_cache_size = 8;
+    cfg.d_model = 1024;
+    cfg.n_layers = 24;
+    cfg.n_heads = 8;
+    cfg.d_head = 128;
+    cfg.subsampling_factor = 8;
+    cfg.n_mels = 128;
+    cfg.sample_rate = 16000;
+    cfg.hop_length = 160;
+    cfg.decoder_hidden = 640;
+    cfg.decoder_layers = 2;
+    cfg.vocab_size = 1025;
+    cfg.blank_token = 1024;
+    cfg.drop_extra_pre_encoded = 2;
+    cfg.last_channel_cache_size = 70;
+    cfg.pre_encode_cache_size = 9;
+    cfg.shift_mel_frames = 8;
+    return cfg;
+}
+
+} // extern "C"
+
+// =============================================================================
 // Pre-built Encoder Graph
 // =============================================================================
 
@@ -122,7 +195,7 @@ void nemo_encoder_graph::build_streaming_encoder(
     const int n_mels = cfg.n_mels;
     const int cache_len = cfg.att_left_context;
     const int conv_cache_len = cfg.conv_kernel_size - 1;
-    size_t mel_chunk_frames = cfg.get_chunk_mel_frames();
+    size_t mel_chunk_frames = nemo_cache_config_get_chunk_mel_frames(&cfg);
     // Create input tensor for mel chunk
     mel_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_mels, mel_chunk_frames, 1);
     ggml_set_name(mel_input, "mel_input");
@@ -1022,7 +1095,7 @@ static std::string process_mel_chunk_streaming(
     // =========================================================================
     // 1. Truncate encoder output to valid_out_len frames
     //    NeMo: encoded = encoded[:, :, :valid_out_len]
-    int32_t valid_out_len = sctx->config.get_valid_out_len();
+    int32_t valid_out_len = nemo_cache_config_get_valid_out_len(&sctx->config);
     if (enc_out_frames > (size_t)valid_out_len) {
         // Only use first valid_out_len frames
         enc_out_frames = valid_out_len;
@@ -1092,7 +1165,7 @@ std::string nemo_stream_process_incremental(
     // Process when we have enough mel frames for the configured chunk size
     // Add to mel buffer if not enough
     size_t total_mels = sctx->mel_buffer.size() / sctx->config.n_mels;
-    size_t graph_mel_frames = sctx->config.get_chunk_mel_frames();
+    size_t graph_mel_frames = nemo_cache_config_get_chunk_mel_frames(&sctx->config);
     if (total_mels < graph_mel_frames) {
         return "";
     }
@@ -1160,9 +1233,9 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
            (double)sctx->total_decode_iterations / sctx->total_chunks_processed);
 
     printf("\n[STREAMING STATS] Config: chunk_mel_frames=%zu, shift_mel_frames=%zu, valid_out_len=%d\n",
-           sctx->config.get_chunk_mel_frames(),
-           sctx->config.get_shift_mel_frames(),
-           sctx->config.get_valid_out_len());
+           nemo_cache_config_get_chunk_mel_frames(&sctx->config),
+           nemo_cache_config_get_shift_mel_frames_val(&sctx->config),
+           nemo_cache_config_get_valid_out_len(&sctx->config));
     printf("[STREAMING STATS] Config: att_left_context=%d, att_right_context=%d, drop_extra_pre_encoded=%d\n",
            sctx->config.att_left_context,
            sctx->config.att_right_context,

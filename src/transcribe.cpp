@@ -14,18 +14,17 @@
 #include <vector>
 
 static void print_usage(const char * prog) {
-    fprintf(stderr, "Usage: %s <model.gguf> <input_file> [--mel] [--cpu|--cuda]\n", prog);
+    fprintf(stderr, "Usage: %s <model.gguf> <input_file> [--mel] [--backend <name>]\n", prog);
     fprintf(stderr, "\n");
-    fprintf(stderr, "  model.gguf  - GGUF model file (convert with scripts/convert_to_gguf.py)\n");
-    fprintf(stderr, "  input_file  - Audio file (PCM i16le 16kHz mono) or mel spectrogram\n");
-    fprintf(stderr, "  --mel       - Input is mel spectrogram [time, 128] float32 (optional)\n");
-    fprintf(stderr, "  --cpu       - Force CPU backend\n");
-    fprintf(stderr, "  --cuda      - Force CUDA backend\n");
+    fprintf(stderr, "  model.gguf       - GGUF model file (convert with scripts/convert_to_gguf.py)\n");
+    fprintf(stderr, "  input_file       - Audio file (PCM i16le 16kHz mono) or mel spectrogram\n");
+    fprintf(stderr, "  --mel            - Input is mel spectrogram [time, 128] float32 (optional)\n");
+    fprintf(stderr, "  --backend <name> - Select backend (default: auto-select first available)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s weights/model.gguf audio.pcm          # PCM audio input (auto backend)\n", prog);
-    fprintf(stderr, "  %s weights/model.gguf audio.pcm --cuda   # Force CUDA backend\n", prog);
-    fprintf(stderr, "  %s weights/model.gguf test.mel.bin --mel # Mel spectrogram input\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm                 # PCM audio input (auto backend)\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf audio.pcm --backend CPU   # Force CPU backend\n", prog);
+    fprintf(stderr, "  %s weights/model.gguf test.mel.bin --mel        # Mel spectrogram input\n", prog);
 }
 
 int main(int argc, char ** argv) {
@@ -38,18 +37,22 @@ int main(int argc, char ** argv) {
     const char * input_path = argv[2];
 
     // Parse optional args
-    nemo_backend_type backend = NEMO_BACKEND_AUTO;
+    const char * backend_name = nullptr;  // nullptr = auto-select
     for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--cpu") == 0) {
-            backend = NEMO_BACKEND_CPU;
-        } else if (strcmp(argv[i], "--cuda") == 0) {
-            backend = NEMO_BACKEND_CUDA;
+        if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 < argc) {
+                backend_name = argv[i + 1];
+                i++;  // skip next argument
+            } else {
+                fprintf(stderr, "Error: --backend requires a backend name\n");
+                return 1;
+            }
         }
     }
 
     // Load model
     printf("Loading model from %s...\n", model_path);
-    struct nemo_context * ctx = nemo_init_with_backend(model_path, backend);
+    struct nemo_context * ctx = nemo_init_with_backend(model_path, backend_name);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;

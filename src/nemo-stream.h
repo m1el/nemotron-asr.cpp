@@ -2,130 +2,13 @@
 #define NEMO_STREAM_H
 
 #include "nemo-ggml.h"
+#include "nemotron_asr_types.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 
-// =============================================================================
-// Cache Configuration
-// =============================================================================
-
-// Latency mode presets for streaming ASR
-// Determines how much lookahead (right context) the encoder sees
-enum class nemo_latency_mode {
-    PURE_CAUSAL   = 0,   // att_right_context=0,  80ms  latency, chunk=8 mel frames
-    ULTRA_LOW     = 1,   // att_right_context=1,  160ms latency, chunk=16 mel frames  
-    LOW           = 6,   // att_right_context=6,  560ms latency, chunk=56 mel frames
-    DEFAULT       = 13,  // att_right_context=13, 1.12s latency, chunk=112 mel frames
-};
-
-// Streaming cache configuration for Nemotron-Speech model
-struct nemo_cache_config {
-    // Attention cache settings
-    int32_t att_left_context   = 70;     // Number of past frames to cache for attention
-    int32_t att_right_context  = 0;      // Lookahead frames (0=pure causal, 1/6/13 = other modes)
-    int32_t cache_drop_size    = 0;      // Frames to drop from cache per step (0 for chunked_limited)
-
-    // Convolution cache settings
-    int32_t conv_kernel_size   = 9;      // Depthwise conv kernel size (from model config)
-    int32_t conv_cache_size    = 8;      // kernel_size - 1
-
-    // Model dimensions
-    int32_t d_model            = 1024;   // Model dimension
-    int32_t n_layers           = 24;     // Number of conformer layers
-    int32_t n_heads            = 8;      // Number of attention heads
-    int32_t d_head             = 128;    // Head dimension
-
-    // Subsampling settings
-    int32_t subsampling_factor = 8;      // Mel frames to encoder frames ratio
-    int32_t n_mels             = 128;    // Number of mel features
-
-    // Audio settings
-    int32_t sample_rate        = 16000;  // Audio sample rate
-    int32_t hop_length         = 160;    // Mel hop length (10ms at 16kHz)
-
-    // Decoder settings
-    int32_t decoder_hidden     = 640;    // LSTM hidden size
-    int32_t decoder_layers     = 2;      // Number of LSTM layers
-    int32_t vocab_size         = 1025;   // Vocabulary size (including blank)
-    int32_t blank_token        = 1024;   // Blank token ID
-
-    // Streaming post-processing settings (from NeMo streaming_cfg)
-    // valid_out_len = 1 + att_right_context (number of encoder frames to output per chunk)
-    int32_t drop_extra_pre_encoded = 2;  // Frames to drop from start after subsampling
-    int32_t last_channel_cache_size = 70; // Max size for attention cache (same as att_left_context)
-    int32_t pre_encode_cache_size = 9;   // Overlap mel frames for conv subsampling context
-    int32_t shift_mel_frames   = 8;      // Mel frames to advance per chunk (NeMo shift_size)
-    
-    // Compute chunk_mel_frames based on att_right_context
-    // This is the total mel frames needed for one encoder step (including overlap)
-    // Formula: chunk_size = pre_encode_cache_size + shift_mel_frames
-    // For pure causal: 9 + 8 = 17 mel frames = 170ms input
-    // For default (att_right_context=13): 9 + 8*(1+13) = 121 mel frames
-    size_t get_chunk_mel_frames() const {
-        // NeMo formula: sampling_frames[1] + subsampling_factor * lookahead_steps
-        // where lookahead_steps = att_right_context
-        // Plus pre_encode_cache_size for the overlap
-        int32_t lookahead_steps = att_right_context;
-        int32_t chunk_without_cache = subsampling_factor + subsampling_factor * lookahead_steps;
-        return pre_encode_cache_size + chunk_without_cache;
-    }
-
-    // Get the number of mel frames to shift/advance per chunk
-    // This determines how many new mel frames are consumed each step
-    size_t get_shift_mel_frames() const {
-        // NeMo formula: shift_size[1] = sampling_frames[1] + sampling_frames[1] * (lookahead_steps - cache_drop_size)
-        // For pure causal with cache_drop_size=0: 8 + 8*0 = 8
-        int32_t lookahead_steps = att_right_context;
-        return subsampling_factor + subsampling_factor * (lookahead_steps - cache_drop_size);
-    }
-    
-    // Compute chunk audio samples based on latency mode
-    // chunk_samples = chunk_mel_frames * hop_length
-    int32_t get_chunk_samples() const {
-        return get_chunk_mel_frames() * hop_length;
-    }
-    
-    // Get latency in milliseconds
-    int32_t get_latency_ms() const {
-        return get_chunk_mel_frames() * hop_length * 1000 / sample_rate;
-    }
-
-    // Get valid output length (encoder frames to output per chunk)
-    // For pure causal (right_context=0): 1 frame
-    // For right_context=6: 7 frames
-    // For right_context=13: 14 frames
-    int32_t get_valid_out_len() const {
-        return 1 + att_right_context;
-    }
-    
-    // Factory methods for different latency modes
-    static nemo_cache_config default_config() {
-        return with_latency(nemo_latency_mode::PURE_CAUSAL);
-    }
-    
-    static nemo_cache_config with_latency(nemo_latency_mode mode) {
-        nemo_cache_config cfg;
-        cfg.att_right_context = static_cast<int32_t>(mode);
-        return cfg;
-    }
-    
-    static nemo_cache_config pure_causal() {
-        return with_latency(nemo_latency_mode::PURE_CAUSAL);
-    }
-    
-    static nemo_cache_config ultra_low_latency() {
-        return with_latency(nemo_latency_mode::ULTRA_LOW);
-    }
-    
-    static nemo_cache_config low_latency() {
-        return with_latency(nemo_latency_mode::LOW);
-    }
-    
-    static nemo_cache_config balanced() {
-        return with_latency(nemo_latency_mode::DEFAULT);
-    }
-};
+// Note: nemo_cache_config, nemo_latency_mode, and their helper functions
+// are defined in nemotron_asr_types.h
 
 // =============================================================================
 // Decoder State - defined in nemo-ggml.h
@@ -192,7 +75,7 @@ struct nemo_stream_context {
     }
 
     size_t shift_mel_frames() const {
-        return config.get_shift_mel_frames();
+        return nemo_cache_config_get_shift_mel_frames_val(&config);
     }
 
     // Pre-built decoder/joint graph (reused across decode steps)
