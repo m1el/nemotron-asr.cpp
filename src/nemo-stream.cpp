@@ -979,7 +979,8 @@ void append_dump_tensor(
 static std::string process_mel_chunk_streaming(
     nemo_stream_context* sctx,
     const float* mel_data,  // [n_mels, n_frames] column-major
-    size_t n_mel_frames
+    size_t n_mel_frames,
+    int valid_out_override = -1  // >=0: keep this many output frames (final partial chunk)
 ) {
     nemo_context* nctx = sctx->nctx;
     const size_t d_model = sctx->config.d_model;
@@ -1054,7 +1055,11 @@ static std::string process_mel_chunk_streaming(
     // =========================================================================
     // 1. Truncate encoder output to valid_out_len frames
     //    NeMo: encoded = encoded[:, :, :valid_out_len]
-    int32_t valid_out_len = sctx->config.get_valid_out_len();
+    // On the final partial chunk the caller overrides this to the number of output
+    // frames that correspond to real (non-zero-padded) audio.
+    int32_t valid_out_len = (valid_out_override >= 0)
+        ? valid_out_override
+        : sctx->config.get_valid_out_len();
     if (enc_out_frames > (size_t)valid_out_len) {
         // Only use first valid_out_len frames
         enc_out_frames = valid_out_len;
@@ -1179,7 +1184,44 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
 
     const size_t transcript_len_before = sctx->transcript.size();
 
-    // (any future tail-flush processing would go here, appending to transcript)
+    // Flush the final partial chunk. process_incremental leaves the mel buffer with
+    // the pre_encode overlap frames plus fewer than shift_mel_frames of real new
+    // audio (otherwise it would have formed a full chunk). NeMo processes this tail
+    // with keep_all_outputs=True, keeping every downsampled frame of the real audio
+    // and stopping at the last sub-sampling unit (remainder < subsampling_factor).
+    //
+    // Our encoder graph is a fixed size, so we zero-pad the tail up to the graph
+    // width and keep only the output frames that correspond to real audio:
+    // subsampling maps subsampling_factor new mel frames to one output frame, so the
+    // tail yields floor(real_new / subsampling_factor) frames. Frames past that come
+    // from the zero padding and are discarded, matching NeMo dropping the < one-unit
+    // remainder.
+    {
+        const size_t n_mels = sctx->config.n_mels;
+        const size_t overlap = sctx->overlap_mel_frames();
+        const size_t sub = sctx->config.subsampling_factor;
+        const size_t graph_mel_frames = sctx->config.get_chunk_mel_frames();
+
+        size_t total_mels = sctx->mel_buffer.size() / n_mels;
+        if (total_mels > overlap) {
+            size_t real_new = total_mels - overlap;
+            int n_valid = (int)(real_new / sub);
+            if (n_valid > 0) {
+                // Zero-pad the buffer up to the graph width (padding is future context
+                // the tail frames should not depend on; kept frames precede it).
+                if (total_mels < graph_mel_frames) {
+                    sctx->mel_buffer.resize(graph_mel_frames * n_mels, 0.0f);
+                }
+                auto t_start = std::chrono::high_resolution_clock::now();
+                std::string tail = process_mel_chunk_streaming(
+                    sctx, sctx->mel_buffer.data(), graph_mel_frames, n_valid);
+                sctx->total_chunks_processed++;
+                auto t_end = std::chrono::high_resolution_clock::now();
+                sctx->total_compute_seconds += std::chrono::duration<double>(t_end - t_start).count();
+                (void)tail;  // already appended to sctx->transcript
+            }
+        }
+    }
 
     #if 0
     // Print streaming statistics
