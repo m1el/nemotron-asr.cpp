@@ -178,6 +178,14 @@ struct nemo_stream_context {
     // Base model context (not owned, must outlive stream context)
     struct nemo_context* nctx;
 
+    // Per-stream preprocessor (owned). Built from the model's host filterbank/window so
+    // each stream keeps its own preemphasis + FFT scratch and cannot corrupt others.
+    struct nemo_preprocessor* preprocessor = nullptr;
+
+    // Per-stream language prompt index (multilingual models). -1 when not applicable.
+    // Mutable across chunks so a stream can switch languages mid-flow.
+    int prompt_index = -1;
+
     // Cache configuration
     nemo_cache_config config;
 
@@ -264,6 +272,11 @@ struct nemo_stream_context* nemo_stream_init(
     struct nemo_context* ctx,
     const nemo_cache_config* config = nullptr  // Use default if nullptr
 );
+
+// Set the decoding language for a stream by prompt code (e.g. "ru-RU", "auto").
+// Takes effect on subsequent chunks (per-chunk prompt switching). Returns true on
+// success; false if the model is not multilingual or the code is unknown.
+bool nemo_stream_set_language(struct nemo_stream_context* sctx, const char* lang);
 
 // Process audio chunk and return new tokens/text
 // audio: int16_t samples at config.sample_rate (16kHz), mono

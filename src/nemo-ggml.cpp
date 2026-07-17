@@ -473,15 +473,15 @@ struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backe
         size_t fb_size = ggml_nelements(fb);
         size_t win_size = ggml_nelements(win);
 
-        std::vector<float> fb_data(fb_size);
-        std::vector<float> win_data(win_size);
-
-        ggml_backend_tensor_get(fb, fb_data.data(), 0, fb_size * sizeof(float));
-        ggml_backend_tensor_get(win, win_data.data(), 0, win_size * sizeof(float));
+        // Cache host copies on the model for per-stream preprocessor construction.
+        ctx->model.preproc_fb_host.resize(fb_size);
+        ctx->model.preproc_win_host.resize(win_size);
+        ggml_backend_tensor_get(fb, ctx->model.preproc_fb_host.data(), 0, fb_size * sizeof(float));
+        ggml_backend_tensor_get(win, ctx->model.preproc_win_host.data(), 0, win_size * sizeof(float));
 
         ctx->preprocessor = nemo_preprocessor_init_from_data(
-            fb_data.data(), fb_size,
-            win_data.data(), win_size
+            ctx->model.preproc_fb_host.data(), fb_size,
+            ctx->model.preproc_win_host.data(), win_size
         );
 
         if (!ctx->preprocessor) {

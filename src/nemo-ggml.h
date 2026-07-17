@@ -188,6 +188,12 @@ struct nemo_model {
     nemo_prompt_kernel prompt_kernel;   // only populated when hparams.num_prompts > 0
     nemo_preprocessor_weights preprocessor_weights;
 
+    // Host copies of the mel filterbank and window, extracted from the backend once at
+    // load. Per-stream preprocessors are built from these so their construction never
+    // touches the backend (see nemo_stream_context::init).
+    std::vector<float> preproc_fb_host;
+    std::vector<float> preproc_win_host;
+
     // Precomputed positional embeddings
     struct ggml_tensor * pos_emb;         // [max_len*2-1, 1024]
 

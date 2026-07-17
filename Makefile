@@ -113,8 +113,12 @@ test_diarize_cluster: tests/test_diarize_cluster.cpp $(DIARIZE_SRCS)
 test_diarize_pipeline: tests/test_diarize_pipeline.cpp $(DIARIZE_SRCS)
 	$(CXX) $(CXXFLAGS) $(DIARIZE_INCLUDES) -I src $^ $(LDFLAGS) -o $@
 
+# Streaming ASR server (TCP / Unix socket)
+server: src/nemo-server.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o nemotron-server
+
 clean:
-	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor
+	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor nemotron-server
 
 clean_bin:
 	rm my_bin/*

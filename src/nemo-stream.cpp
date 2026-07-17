@@ -37,6 +37,20 @@ void nemo_stream_context::init(struct nemo_context* ctx, const nemo_cache_config
     nctx = ctx;
     config = cfg;
 
+    // Build this stream's own preprocessor from the model's host filterbank/window, so
+    // concurrent streams don't share preemphasis/FFT state. Falls back to the shared one
+    // if host copies are unavailable (older load path).
+    if (!preprocessor) {
+        if (!ctx->model.preproc_fb_host.empty() && !ctx->model.preproc_win_host.empty()) {
+            preprocessor = nemo_preprocessor_init_from_data(
+                ctx->model.preproc_fb_host.data(), ctx->model.preproc_fb_host.size(),
+                ctx->model.preproc_win_host.data(), ctx->model.preproc_win_host.size());
+        }
+    }
+
+    // Default language prompt for multilingual models (101 = "auto").
+    prompt_index = (ctx->model.hparams.num_prompts > 0) ? ctx->prompt_index : -1;
+
     // Initialize decoder state
     decoder_state.init(cfg.decoder_layers, cfg.decoder_hidden);
     decoder_state.prev_token = cfg.blank_token;
@@ -108,6 +122,10 @@ nemo_stream_context::~nemo_stream_context() {
     if (decode_ctx) {
         ggml_free(decode_ctx);
         decode_ctx = nullptr;
+    }
+    if (preprocessor) {
+        nemo_preprocessor_free(preprocessor);
+        preprocessor = nullptr;
     }
 }
 
@@ -710,8 +728,24 @@ struct nemo_stream_context* nemo_stream_init(
     cfg.decoder_layers     = nemo_decoder::NUM_LAYERS;
 
     sctx->init(ctx, cfg);
-    
+
     return sctx;
+}
+
+bool nemo_stream_set_language(struct nemo_stream_context* sctx, const char* lang) {
+    if (!sctx || !lang) return false;
+    if (sctx->nctx->model.hparams.num_prompts <= 0) {
+        fprintf(stderr, "%s: model is not multilingual (num_prompts=0)\n", __func__);
+        return false;
+    }
+    auto& dict = sctx->nctx->model.prompt_dict;
+    auto it = dict.find(lang);
+    if (it == dict.end()) {
+        fprintf(stderr, "%s: unknown language code '%s'\n", __func__, lang);
+        return false;
+    }
+    sctx->prompt_index = it->second;
+    return true;
 }
 
 // Forward declaration for token to text conversion (from nemo-ggml.cpp)
@@ -1015,7 +1049,7 @@ static std::string process_mel_chunk_streaming(
         struct ggml_tensor * p = sctx->encoder_graph.prompt_input;
         const int64_t num_prompts = p->ne[0];
         const int64_t frames = p->ne[1] * p->ne[2];
-        int idx = nctx->prompt_index;
+        int idx = sctx->prompt_index;
         if (idx < 0 || idx >= num_prompts) idx = 0;
         std::vector<float> prompt_data(num_prompts * frames, 0.0f);
         for (int64_t i = 0; i < frames; i++) {
@@ -1120,7 +1154,8 @@ std::string nemo_stream_process_incremental(
     sctx->total_audio_seconds += (double)n_samples / sctx->config.sample_rate;
     
     // Convert audio to mel spectrogram
-    struct nemo_preprocessor* pp = sctx->nctx->preprocessor;
+    // Prefer this stream's own preprocessor; fall back to the shared one if unavailable.
+    struct nemo_preprocessor* pp = sctx->preprocessor ? sctx->preprocessor : sctx->nctx->preprocessor;
     std::vector<float> mel;
     size_t n_mel_frames = nemo_preprocessor_process(pp, audio, n_samples, mel);
     (void)n_mel_frames;
