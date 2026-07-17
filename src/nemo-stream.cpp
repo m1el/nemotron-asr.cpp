@@ -1165,9 +1165,21 @@ std::string nemo_stream_process_incremental(
     return all_text;
 }
 
-// Finalize streaming and return final transcript
+// Finalize streaming and return ONLY text produced during finalization.
+//
+// process_incremental already emits each chunk's delta (which the caller prints
+// live) and appends it to sctx->transcript. Returning the whole transcript here
+// therefore double-prints everything. We return the suffix appended since entry
+// instead -- currently empty, since no tail flush is performed. (The partial final
+// sub-chunk of audio is dropped, unchanged from before; flushing it safely needs a
+// reference-validated zero-pad decode and is left as a follow-up.) Writing it as a
+// suffix-diff keeps this correct if such a flush is added later.
 std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
     if (!sctx) return "";
+
+    const size_t transcript_len_before = sctx->transcript.size();
+
+    // (any future tail-flush processing would go here, appending to transcript)
 
     #if 0
     // Print streaming statistics
@@ -1200,7 +1212,7 @@ std::string nemo_stream_finalize(struct nemo_stream_context* sctx) {
            sctx->config.att_right_context,
            sctx->config.drop_extra_pre_encoded);
     #endif
-    return sctx->transcript;
+    return sctx->transcript.substr(transcript_len_before);
 }
 
 // Get accumulated transcript
