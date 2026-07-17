@@ -33,7 +33,7 @@
 static void print_usage(const char * prog) {
     fprintf(stderr,
         "Usage: %s <model.gguf> <audio.pcm|-> [chunk_ms] [right_context]\n"
-        "       [--cpu|--cuda|--metal]\n"
+        "       [--cpu|--cuda|--metal] [--lang <code>]\n"
         "       [--diarize <diarize.gguf>]\n"
         "       [--rttm <path>] [--speaker-text <path>] [--json <path>]\n"
         "       [--num-speakers <K>] [--sub-shift <sec>]\n"
@@ -43,6 +43,8 @@ static void print_usage(const char * prog) {
         "  chunk_ms         streaming chunk size (default 80)\n"
         "  right_context    attention right context (0/1/6/13, default 0)\n"
         "  --cpu|--cuda|--metal  backend selection\n"
+        "  --lang <code>    language for multilingual models (e.g. en-US, ru-RU,\n"
+        "                   zh-CN, auto). Default: auto. Ignored for English-only models.\n"
         "  --diarize <file> enable diarization with the given diarize.gguf\n"
         "  --rttm <file>    write RTTM output (only with --diarize)\n"
         "  --speaker-text <file>  write speaker-tagged transcript at EOF\n"
@@ -68,6 +70,7 @@ int main(int argc, char ** argv) {
     const char * audio_path = argv[2];
     int chunk_ms = 80;
     int right_context = 0;
+    const char * lang = nullptr;  // language code for multilingual models
     nemo_backend_type backend = NEMO_BACKEND_AUTO;
 
     std::string diarize_gguf, rttm_path, speaker_text_path, json_path;
@@ -83,6 +86,7 @@ int main(int argc, char ** argv) {
         if (a == "--cpu")        backend = NEMO_BACKEND_CPU;
         else if (a == "--cuda")  backend = NEMO_BACKEND_CUDA;
         else if (a == "--metal") backend = NEMO_BACKEND_METAL;
+        else if (a == "--lang"         && i + 1 < argc) lang              = argv[++i];
         else if (a == "--diarize"      && i + 1 < argc) diarize_gguf      = argv[++i];
         else if (a == "--rttm"         && i + 1 < argc) rttm_path         = argv[++i];
         else if (a == "--speaker-text" && i + 1 < argc) speaker_text_path = argv[++i];
@@ -121,6 +125,17 @@ int main(int argc, char ** argv) {
     nemo_context * ctx = nemo_init_with_backend(model_path, backend);
     if (!ctx) { fprintf(stderr, "Failed to load ASR model\n"); return 1; }
 
+    // Select decoding language for multilingual models (default: auto).
+    if (lang) {
+        if (!nemo_set_language(ctx, lang)) {
+            fprintf(stderr, "Failed to set language '%s'\n", lang);
+            nemo_free(ctx);
+            return 1;
+        }
+        fprintf(stderr, "  Language:       %s\n", lang);
+    }
+
+    // Initialize cache-aware streaming context
     nemo_cache_config cache_cfg = nemo_cache_config::default_config();
     cache_cfg.att_right_context = right_context;
     nemo_stream_context * sctx = nemo_stream_init(ctx, &cache_cfg);

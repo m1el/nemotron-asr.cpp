@@ -105,6 +105,16 @@ def write_kv_array_string(f, key: str, values: list[str]):
         write_string(f, v)
 
 
+def write_kv_array_int32(f, key: str, values: list[int]):
+    """Write an array-of-int32 key-value pair."""
+    write_string(f, key)
+    f.write(struct.pack('<i', GGUF_TYPE_ARRAY))
+    f.write(struct.pack('<i', GGUF_TYPE_INT32))
+    f.write(struct.pack('<Q', len(values)))
+    for v in values:
+        f.write(struct.pack('<i', v))
+
+
 def quantize_q8_0(data: np.ndarray) -> bytes:
     """
     Quantize float32 array to Q8_0 format (fully vectorized).
@@ -365,6 +375,15 @@ def convert_to_gguf(
 
     model_name = Path(input_path).stem
 
+    # Language prompt dictionary (multilingual models): maps a language code such as
+    # "en-US" or "auto" to a prompt index. Stored as two parallel GGUF arrays so the
+    # C++ loader can resolve --lang codes to indices.
+    prompt_dict = model_config.get('model_defaults', {}).get('prompt_dictionary', {})
+    prompt_langs = sorted(prompt_dict.keys())
+    prompt_ids = [int(prompt_dict[k]) for k in prompt_langs]
+    if prompt_dict:
+        print(f"\nPrompt dictionary: {len(prompt_langs)} language codes")
+
     # Prepare tensor info
     tensor_infos = []
     current_offset = 0
@@ -465,7 +484,9 @@ def convert_to_gguf(
     # The legacy blob is written alongside the string array whenever every token fits,
     # so that binaries predating the string-array reader keep loading English models.
     vocab_legacy = pack_vocab_legacy(vocab)
-    n_kv = len(hparams) + 3 + (1 if vocab_legacy is not None else 0)
+    n_kv = len(hparams) + 3
+    n_kv += 1 if vocab_legacy is not None else 0
+    n_kv += 2 if prompt_dict else 0
 
     with open(output_path, 'wb') as f:
         # Write header
@@ -480,6 +501,9 @@ def convert_to_gguf(
         write_kv_array_string(f, "tokenizer.vocab_list", vocab)
         if vocab_legacy is not None:
             write_kv_string(f, "tokenizer.vocab", vocab_legacy)
+        if prompt_dict:
+            write_kv_array_string(f, "nemo.prompt_langs", prompt_langs)
+            write_kv_array_int32(f, "nemo.prompt_ids", prompt_ids)
 
         for key, value in hparams.items():
             if isinstance(value, int):

@@ -21,6 +21,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --mel       - Input is mel spectrogram [time, 128] float32 (optional)\n");
     fprintf(stderr, "  --cpu       - Force CPU backend\n");
     fprintf(stderr, "  --cuda      - Force CUDA backend\n");
+    fprintf(stderr, "  --lang <c>  - Language for multilingual models (e.g. en-US, ru-RU, auto)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s weights/model.gguf audio.pcm          # PCM audio input (auto backend)\n", prog);
@@ -39,11 +40,18 @@ int main(int argc, char ** argv) {
 
     // Parse optional args
     nemo_backend_type backend = NEMO_BACKEND_AUTO;
+    const char * lang = nullptr;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--cpu") == 0) {
             backend = NEMO_BACKEND_CPU;
         } else if (strcmp(argv[i], "--cuda") == 0) {
             backend = NEMO_BACKEND_CUDA;
+        } else if (strcmp(argv[i], "--lang") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --lang requires a language code\n");
+                return 1;
+            }
+            lang = argv[++i];
         }
     }
 
@@ -55,6 +63,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
     printf("Model loaded successfully (backend: %s)\n", nemo_get_backend_name(ctx));
+
+    if (lang && !nemo_set_language(ctx, lang)) {
+        fprintf(stderr, "Failed to set language '%s'\n", lang);
+        nemo_free(ctx);
+        return 1;
+    }
 
     // Load input file
     FILE * f = fopen(input_path, "rb");

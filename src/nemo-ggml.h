@@ -181,6 +181,7 @@ struct nemo_preprocessor_weights {
 struct nemo_model {
     nemo_hparams hparams;
     std::vector<std::string> vocab;
+    std::map<std::string, int> prompt_dict;   // language code -> prompt index (multilingual)
     nemo_encoder encoder;
     nemo_decoder decoder;
     nemo_joint joint;
@@ -252,6 +253,11 @@ struct nemo_context * nemo_init(const char * model_path);
 struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backend_type backend);
 
 void nemo_free(struct nemo_context * ctx);
+
+// Set the decoding language for multilingual models by prompt code (e.g. "en-US",
+// "ru-RU", "auto"). Returns true on success; false if the model is not multilingual
+// or the code is unknown (in which case prompt_index is left unchanged).
+bool nemo_set_language(struct nemo_context * ctx, const char * lang);
 
 // Get current backend name
 const char * nemo_get_backend_name(struct nemo_context * ctx);
@@ -331,6 +337,16 @@ struct ggml_tensor * build_encoder(
     struct ggml_context * ctx,
     struct ggml_tensor * mel,       // [n_mels, time, batch]
     nemo_model * model              // model with all weights
+);
+
+// Language-ID prompt fusion (multilingual checkpoints). See nemo-ggml.cpp.
+// encoder_out [d_model, time, batch], prompt_onehot [num_prompts, time, batch]
+// -> [d_model, time, batch]
+struct ggml_tensor * build_prompt_fusion(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,
+    struct ggml_tensor * prompt_onehot,
+    nemo_model * model
 );
 
 // Run inference from mel spectrogram

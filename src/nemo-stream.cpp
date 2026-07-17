@@ -213,6 +213,16 @@ void nemo_encoder_graph::build_streaming_encoder(
         );
     }
 
+    // Language-ID prompt fusion for multilingual checkpoints. The one-hot is a graph
+    // input filled per chunk, so the prompt (language) can change between chunks.
+    const int num_prompts = nctx->model.hparams.num_prompts;
+    if (num_prompts > 0) {
+        prompt_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, num_prompts, cur->ne[1], cur->ne[2]);
+        ggml_set_name(prompt_input, "prompt_onehot");
+        ggml_set_input(prompt_input);
+        cur = build_prompt_fusion(ctx, cur, prompt_input, &nctx->model);
+    }
+
     encoder_out = cur;
 
     // Build the compute graph
@@ -673,24 +683,32 @@ struct nemo_stream_context* nemo_stream_init(
     
     nemo_stream_context* sctx = new nemo_stream_context();
     
-    // Use provided config or create default from model
+    // The caller's config supplies only latency/streaming choices (att_right_context
+    // and friends). Model-architecture fields are always taken from the loaded header
+    // so a second checkpoint cannot be silently misconfigured -- previously these were
+    // synced only on the nullptr-config path, which the production binary never takes.
     nemo_cache_config cfg;
     if (config) {
         cfg = *config;
-    } else {
-        // Default config based on model
-        cfg.d_model = ctx->model.hparams.d_model;
-        cfg.n_layers = ctx->model.hparams.n_layers;
-        cfg.n_heads = ctx->model.hparams.n_heads;
-        cfg.d_head = ctx->model.hparams.d_head;
-        cfg.conv_kernel_size = ctx->model.hparams.kernel_size;
-        cfg.conv_cache_size = cfg.conv_kernel_size - 1;
-        cfg.vocab_size = ctx->model.hparams.vocab_size;
-        cfg.blank_token = cfg.vocab_size - 1;
-        cfg.decoder_hidden = nemo_decoder::HIDDEN_SIZE;
-        cfg.decoder_layers = nemo_decoder::NUM_LAYERS;
     }
-    
+    const nemo_hparams & hp = ctx->model.hparams;
+    cfg.d_model            = hp.d_model;
+    cfg.n_layers           = hp.n_layers;
+    cfg.n_heads            = hp.n_heads;
+    cfg.d_head             = hp.d_head;
+    cfg.conv_kernel_size   = hp.kernel_size;
+    cfg.conv_cache_size    = hp.kernel_size - 1;
+    cfg.n_mels             = hp.n_mels;
+    cfg.subsampling_factor = hp.subsampling_factor;
+    cfg.att_left_context   = hp.att_left_context;
+    cfg.last_channel_cache_size = hp.att_left_context;
+    // pre_encode_cache_size is a property of the (shared) subsampling stack, not the
+    // conformer conv kernel, so its default is correct for both checkpoints.
+    cfg.vocab_size         = hp.vocab_size;
+    cfg.blank_token        = hp.blank_token();
+    cfg.decoder_hidden     = nemo_decoder::HIDDEN_SIZE;
+    cfg.decoder_layers     = nemo_decoder::NUM_LAYERS;
+
     sctx->init(ctx, cfg);
     
     return sctx;
@@ -990,6 +1008,20 @@ static std::string process_mel_chunk_streaming(
     }
     ggml_backend_tensor_set(sctx->encoder_graph.attn_mask, mask_data.data(), 0,
                             kv_len * sizeof(float));
+
+    // Fill the one-hot language prompt for this chunk (multilingual models).
+    if (sctx->encoder_graph.prompt_input) {
+        struct ggml_tensor * p = sctx->encoder_graph.prompt_input;
+        const int64_t num_prompts = p->ne[0];
+        const int64_t frames = p->ne[1] * p->ne[2];
+        int idx = nctx->prompt_index;
+        if (idx < 0 || idx >= num_prompts) idx = 0;
+        std::vector<float> prompt_data(num_prompts * frames, 0.0f);
+        for (int64_t i = 0; i < frames; i++) {
+            prompt_data[i * num_prompts + idx] = 1.0f;
+        }
+        ggml_backend_tensor_set(p, prompt_data.data(), 0, prompt_data.size() * sizeof(float));
+    }
 
     // Run encoder graph (measure encoder time)
     auto t_encoder_start = std::chrono::high_resolution_clock::now();

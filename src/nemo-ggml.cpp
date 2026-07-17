@@ -168,6 +168,19 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
         return false;
     }
 
+    // Language prompt dictionary (multilingual models): parallel arrays of codes/ids.
+    {
+        int64_t lk = gguf_find_key(gguf_ctx, "nemo.prompt_langs");
+        int64_t vk = gguf_find_key(gguf_ctx, "nemo.prompt_ids");
+        if (lk >= 0 && vk >= 0) {
+            const size_t n = gguf_get_arr_n(gguf_ctx, lk);
+            const int32_t * ids = (const int32_t *) gguf_get_arr_data(gguf_ctx, vk);
+            for (size_t i = 0; i < n; i++) {
+                model.prompt_dict[gguf_get_arr_str(gguf_ctx, lk, i)] = ids[i];
+            }
+        }
+    }
+
     // printf("%s: n_mels     = %d\n", __func__, model.hparams.n_mels);
     // printf("%s: d_model    = %d\n", __func__, model.hparams.d_model);
     // printf("%s: n_heads    = %d\n", __func__, model.hparams.n_heads);
@@ -479,6 +492,21 @@ struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backe
     }
 
     return ctx;
+}
+
+bool nemo_set_language(struct nemo_context * ctx, const char * lang) {
+    if (!ctx || !lang) return false;
+    if (ctx->model.hparams.num_prompts <= 0) {
+        fprintf(stderr, "%s: model is not multilingual (num_prompts=0)\n", __func__);
+        return false;
+    }
+    auto it = ctx->model.prompt_dict.find(lang);
+    if (it == ctx->model.prompt_dict.end()) {
+        fprintf(stderr, "%s: unknown language code '%s'\n", __func__, lang);
+        return false;
+    }
+    ctx->prompt_index = it->second;
+    return true;
 }
 
 const char * nemo_get_backend_name(struct nemo_context * ctx) {

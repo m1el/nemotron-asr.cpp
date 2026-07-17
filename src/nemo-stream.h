@@ -145,6 +145,7 @@ struct nemo_encoder_graph {
     // Input tensors (set data before compute)
     struct ggml_tensor* mel_input;     // [n_mels, chunk_frames, 1]
     struct ggml_tensor* attn_mask;     // [kv_len, 1] attention mask for invalid cache positions
+    struct ggml_tensor* prompt_input;  // [num_prompts, chunk_len, 1] one-hot; null if no prompts
 
     // Cache tensors - single tensors with layer dimension, views used per-layer
     struct ggml_tensor* k_cache;       // [d_model, cache_len, n_layers]
@@ -157,7 +158,7 @@ struct nemo_encoder_graph {
     bool initialized;
     
     nemo_encoder_graph() : ctx(nullptr), graph(nullptr), allocr(nullptr),
-                           mel_input(nullptr), attn_mask(nullptr),
+                           mel_input(nullptr), attn_mask(nullptr), prompt_input(nullptr),
                            k_cache(nullptr), v_cache(nullptr), conv_cache(nullptr),
                            encoder_out(nullptr), initialized(false) {}
     ~nemo_encoder_graph();
