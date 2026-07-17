@@ -132,17 +132,40 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
     kv_idx = gguf_find_key(gguf_ctx, "nemo.joint_dim");
     if (kv_idx >= 0) model.hparams.joint_dim = gguf_get_val_u32(gguf_ctx, kv_idx);
 
-    // Load vocabulary
-    // vocab is stored as a string containing vocab_size * 8 bytes (each token is a char8)
-    kv_idx = gguf_find_key(gguf_ctx, "tokenizer.vocab");
+    kv_idx = gguf_find_key(gguf_ctx, "nemo.subsampling_factor");
+    if (kv_idx >= 0) model.hparams.subsampling_factor = gguf_get_val_u32(gguf_ctx, kv_idx);
+
+    kv_idx = gguf_find_key(gguf_ctx, "nemo.att_left_context");
+    if (kv_idx >= 0) model.hparams.att_left_context = gguf_get_val_u32(gguf_ctx, kv_idx);
+
+    kv_idx = gguf_find_key(gguf_ctx, "nemo.num_prompts");
+    if (kv_idx >= 0) model.hparams.num_prompts = gguf_get_val_u32(gguf_ctx, kv_idx);
+
+    // Load vocabulary.
+    // Preferred: "tokenizer.vocab_list", a GGUF array of strings with no length limit.
+    // Legacy:    "tokenizer.vocab", a blob of fixed 8-byte NUL-padded records. That
+    // format cannot hold the multilingual vocab, ~7% of whose tokens exceed 7 bytes,
+    // so English-only files carry both keys and multilingual files carry only the array.
+    kv_idx = gguf_find_key(gguf_ctx, "tokenizer.vocab_list");
     if (kv_idx >= 0) {
+        const size_t n_tokens = gguf_get_arr_n(gguf_ctx, kv_idx);
+        model.vocab.resize(n_tokens);
+        for (size_t i = 0; i < n_tokens; i++) {
+            model.vocab[i] = gguf_get_arr_str(gguf_ctx, kv_idx, i);
+        }
+    } else if ((kv_idx = gguf_find_key(gguf_ctx, "tokenizer.vocab")) >= 0) {
         const char * vocab_data = gguf_get_val_str(gguf_ctx, kv_idx);
-        // Use vocab_size from hparams (already loaded), each entry is 8 bytes
-        size_t n_tokens = model.hparams.vocab_size;  // 1025
-        size_t vocab_entry_size = 8;  // char8
-        size_t vocab_bytes = n_tokens * vocab_entry_size;
-        model.vocab.resize(n_tokens, {0});
-        memcpy(model.vocab.data(), vocab_data, vocab_bytes);
+        // The blob holds only the real tokens; vocab_size counts the blank as well.
+        // Copying vocab_size records used to read 8 bytes past the end on every load.
+        const size_t n_tokens = model.hparams.vocab_size - 1;
+        model.vocab.resize(n_tokens);
+        for (size_t i = 0; i < n_tokens; i++) {
+            const char * rec = vocab_data + i * 8;
+            model.vocab[i].assign(rec, strnlen(rec, 8));
+        }
+    } else {
+        fprintf(stderr, "%s: no vocabulary in GGUF (need tokenizer.vocab_list or tokenizer.vocab)\n", __func__);
+        return false;
     }
 
     // printf("%s: n_mels     = %d\n", __func__, model.hparams.n_mels);
@@ -351,6 +374,12 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
     model.joint.out_w = model.tensors["joint.joint_net.2.weight"];
     model.joint.out_b = model.tensors["joint.joint_net.2.bias"];
 
+    // Language-ID prompt kernel (multilingual checkpoints only)
+    model.prompt_kernel.fc1_w = model.tensors["prompt_kernel.0.weight"];
+    model.prompt_kernel.fc1_b = model.tensors["prompt_kernel.0.bias"];
+    model.prompt_kernel.fc2_w = model.tensors["prompt_kernel.2.weight"];
+    model.prompt_kernel.fc2_b = model.tensors["prompt_kernel.2.bias"];
+
     // Preprocessor weights
     model.preprocessor_weights.filterbank = model.tensors["preprocessor.featurizer.fb"];
     model.preprocessor_weights.window = model.tensors["preprocessor.featurizer.window"];
@@ -379,6 +408,18 @@ bool nemo_model_load(const std::string & path, nemo_model & model, nemo_backend_
     check(model.preprocessor_weights.filterbank, "preprocessor.featurizer.fb");
     check(model.preprocessor_weights.window, "preprocessor.featurizer.window");
 
+    // The prompt kernel must be present exactly when the header advertises prompts;
+    // a mismatch means the header and the weights disagree about the model.
+    if (model.hparams.num_prompts > 0) {
+        check(model.prompt_kernel.fc1_w, "prompt_kernel.0.weight");
+        check(model.prompt_kernel.fc1_b, "prompt_kernel.0.bias");
+        check(model.prompt_kernel.fc2_w, "prompt_kernel.2.weight");
+        check(model.prompt_kernel.fc2_b, "prompt_kernel.2.bias");
+    } else if (model.prompt_kernel.fc1_w) {
+        fprintf(stderr, "%s: prompt_kernel weights present but nemo.num_prompts is 0\n", __func__);
+        missing = true;
+    }
+
     if (missing) {
         return false;
     }
@@ -397,6 +438,14 @@ struct nemo_context * nemo_init_with_backend(const char * model_path, nemo_backe
     if (!nemo_model_load(model_path, ctx->model, backend)) {
         delete ctx;
         return nullptr;
+    }
+
+    // Derive runtime blank/prompt from the loaded header rather than hardcoding.
+    ctx->state.blank_token = ctx->model.hparams.blank_token();
+    ctx->state.reset();
+    if (ctx->model.hparams.num_prompts > 0) {
+        // 101 = "auto" (language-agnostic) in the multilingual prompt dictionary.
+        ctx->prompt_index = 101;
     }
 
     // Initialize allocator for compute graphs
@@ -1001,6 +1050,53 @@ struct ggml_tensor * build_encoder(
     return cur;  // [d_model, time/8, batch]
 }
 
+// Language-ID prompt fusion (multilingual checkpoints).
+// Mirrors NeMo's PromptStreamingMixin: concat the one-hot language vector onto the
+// encoder output along the feature axis, then Linear->ReLU->Linear back to d_model.
+//   encoder_out  [d_model, time, batch]
+//   prompt_onehot[num_prompts, time, batch]  (one-hot, broadcast across time by caller)
+// Returns [d_model, time, batch]. Dimension-preserving; no residual, no layernorm.
+struct ggml_tensor * build_prompt_fusion(
+    struct ggml_context * ctx,
+    struct ggml_tensor * encoder_out,
+    struct ggml_tensor * prompt_onehot,
+    nemo_model * model
+) {
+    const nemo_prompt_kernel & pk = model->prompt_kernel;
+
+    // [d_model + num_prompts, time, batch]; encoder features first to match the
+    // trained weight ordering (torch.cat([encoded, prompt], dim=-1)).
+    struct ggml_tensor * cat = ggml_concat(ctx, encoder_out, prompt_onehot, 0);
+
+    struct ggml_tensor * h = ggml_mul_mat(ctx, pk.fc1_w, cat);   // [2048, time, batch]
+    h = ggml_add(ctx, h, pk.fc1_b);
+    h = ggml_relu(ctx, h);
+    h = ggml_mul_mat(ctx, pk.fc2_w, h);                          // [d_model, time, batch]
+    h = ggml_add(ctx, h, pk.fc2_b);
+    return h;
+}
+
+// Build a one-hot prompt tensor [num_prompts, time, batch] as a graph input leaf.
+// Fill it with fill_prompt_onehot after graph allocation.
+static struct ggml_tensor * make_prompt_input(
+    struct ggml_context * ctx, int num_prompts, int time, int batch
+) {
+    struct ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, num_prompts, time, batch);
+    ggml_set_name(p, "prompt_onehot");
+    ggml_set_input(p);
+    return p;
+}
+
+static void fill_prompt_onehot(struct ggml_tensor * p, int prompt_index) {
+    const int64_t num_prompts = p->ne[0];
+    const int64_t n = p->ne[1] * p->ne[2];
+    std::vector<float> host(num_prompts * n, 0.0f);
+    for (int64_t i = 0; i < n; i++) {
+        host[i * num_prompts + prompt_index] = 1.0f;
+    }
+    ggml_backend_tensor_set(p, host.data(), 0, host.size() * sizeof(float));
+}
+
 // ============================================================================
 // Decoder (RNNT Prediction Network)
 // ============================================================================
@@ -1431,16 +1527,17 @@ std::vector<timed_token> greedy_decode_with_state(
 // Convert token IDs to text
 std::string tokens_to_text(
     const std::vector<struct timed_token> & tokens,
-    const std::vector<char8> & vocab,
+    const std::vector<std::string> & vocab,
     bool timestamp_words = false
 ) {
     std::string result;
     for (const struct timed_token & token : tokens) {
         int token_id = token.token_id;
         if (token_id >= 0 && token_id < (int)vocab.size()) {
-            std::string_view piece(vocab[token_id].data);
+            std::string_view piece(vocab[token_id]);
+            // The multilingual model emits <xx-XX> language markers inline; keep them.
             // SentencePiece convention: ▁ (U+2581, 3 bytes) means space/word start
-            if (strncmp(piece.data(), "\xe2\x96\x81", 3) == 0) {
+            if (piece.compare(0, 3, "\xe2\x96\x81") == 0) {
                 // UTF-8 for ▁ (U+2581)
                 result += ' ';
                 if (timestamp_words) {
@@ -1500,6 +1597,14 @@ std::vector<timed_token> nemo_encode(
 
     // Build encoder graph
     struct ggml_tensor * encoder_out = build_encoder(ctx0, inp, &ctx->model);
+
+    // Language-ID prompt fusion for multilingual checkpoints.
+    struct ggml_tensor * prompt_inp = nullptr;
+    if (ctx->model.hparams.num_prompts > 0) {
+        prompt_inp = make_prompt_input(ctx0, ctx->model.hparams.num_prompts,
+                                       encoder_out->ne[1], encoder_out->ne[2]);
+        encoder_out = build_prompt_fusion(ctx0, encoder_out, prompt_inp, &ctx->model);
+    }
     ggml_set_name(encoder_out, "encoder_output");
     ggml_set_output(encoder_out);
 
@@ -1517,6 +1622,9 @@ std::vector<timed_token> nemo_encode(
 
 
     ggml_backend_tensor_set(inp, mel_data, 0, n_mel_frames * n_mels * sizeof(float));
+    if (prompt_inp) {
+        fill_prompt_onehot(prompt_inp, ctx->prompt_index);
+    }
 
     // Run encoder
     ggml_backend_graph_compute(ctx->model.backend, gf);

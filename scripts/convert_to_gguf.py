@@ -36,6 +36,11 @@ GGUF_TYPE_UINT32 = 4
 GGUF_TYPE_INT32 = 5
 GGUF_TYPE_FLOAT32 = 6
 GGUF_TYPE_STRING = 8
+GGUF_TYPE_ARRAY = 9
+
+# Tokens longer than this (including the NUL terminator) cannot be represented in
+# the legacy fixed-record vocab KV. The multilingual vocab has tokens up to 25 bytes.
+LEGACY_VOCAB_WORD_SIZE = 8
 
 # GGML tensor types
 GGML_TYPE_F32 = 0
@@ -88,6 +93,16 @@ def write_kv_float32(f, key: str, value: float):
     write_string(f, key)
     f.write(struct.pack('<i', GGUF_TYPE_FLOAT32))
     f.write(struct.pack('<f', value))
+
+
+def write_kv_array_string(f, key: str, values: list[str]):
+    """Write an array-of-string key-value pair."""
+    write_string(f, key)
+    f.write(struct.pack('<i', GGUF_TYPE_ARRAY))
+    f.write(struct.pack('<i', GGUF_TYPE_STRING))
+    f.write(struct.pack('<Q', len(values)))
+    for v in values:
+        write_string(f, v)
 
 
 def quantize_q8_0(data: np.ndarray) -> bytes:
@@ -238,26 +253,48 @@ def should_quantize(name: str, patterns: list[str], exclude_patterns: list[str])
     return False
 
 
-def load_nemo_model(path: str) -> Tuple[dict, bytes]:
+def extract_member(tar: tarfile.TarFile, basename: str):
+    """Extract a .nemo member by basename.
+
+    Archives are inconsistent about the leading "./": the English checkpoint uses it,
+    the multilingual one does not.
+    """
+    for name in tar.getnames():
+        if Path(name).name == basename:
+            return tar.extractfile(name)
+    raise KeyError(f"{basename} not found in archive (members: {tar.getnames()})")
+
+
+def load_nemo_model(path: str) -> Tuple[dict, list[str], dict]:
     with tarfile.open(path) as tar:
-        model_config = tar.extractfile("./model_config.yaml")
-        model_config = yaml.safe_load(model_config)
-        vocab = load_vocab(model_config['joint']['vocabulary'])
-        weights = tar.extractfile("./model_weights.ckpt")
+        model_config = yaml.safe_load(extract_member(tar, "model_config.yaml"))
+        vocab = [str(t) for t in model_config['joint']['vocabulary']]
+        print(f"Loaded vocab with {len(vocab)} tokens")
+        weights = extract_member(tar, "model_weights.ckpt")
         torch_weights = torch.load(weights, weights_only=True, map_location='cpu')
         numpy_weights = {name: tensor.numpy() for name, tensor in torch_weights.items()}
-    return numpy_weights, vocab
+    return numpy_weights, vocab, model_config
 
 
-def load_vocab(vocab: list[str]) -> bytes:
-    print(f"Loaded vocab with {len(vocab)} tokens")
-    WORD_SIZE_BYTES = 8
-    rv = bytearray(len(vocab) * WORD_SIZE_BYTES)
+def pack_vocab_legacy(vocab: list[str]) -> bytes | None:
+    """Pack the vocab into the legacy fixed-8-byte-record blob.
+
+    Returns None when any token needs more room than a record provides, which is
+    the case for the multilingual vocabs: ~7% of their tokens exceed 7 bytes.
+    """
+    too_long = [t for t in vocab if len(t.encode("utf-8")) + 1 > LEGACY_VOCAB_WORD_SIZE]
+    if too_long:
+        print(
+            f"  Legacy vocab KV omitted: {len(too_long)} of {len(vocab)} tokens exceed "
+            f"{LEGACY_VOCAB_WORD_SIZE - 1} bytes (longest: {max(len(t.encode('utf-8')) for t in too_long)})"
+        )
+        return None
+
+    rv = bytearray(len(vocab) * LEGACY_VOCAB_WORD_SIZE)
     for i, ch in enumerate(vocab):
         encoded = ch.encode("utf-8") + b"\0"
-        assert len(encoded) <= WORD_SIZE_BYTES, f"token too long: {ch}"
-        rv[i * WORD_SIZE_BYTES:i * WORD_SIZE_BYTES + len(encoded)] = encoded
-    return rv
+        rv[i * LEGACY_VOCAB_WORD_SIZE:i * LEGACY_VOCAB_WORD_SIZE + len(encoded)] = encoded
+    return bytes(rv)
 
 
 def convert_to_gguf(
@@ -268,7 +305,7 @@ def convert_to_gguf(
     exclude_patterns: list[str] = None,
 ):
     """Convert NEMO weights to GGUF format with optional quantization."""
-    tensors, vocab = load_nemo_model(input_path)
+    tensors, vocab, model_config = load_nemo_model(input_path)
     print(f"\nLoaded {len(tensors)} tensors")
 
     # Parse quantization type
@@ -293,19 +330,40 @@ def convert_to_gguf(
     if exclude_patterns is None:
         exclude_patterns = []
 
-    # Model hyperparameters
+    # Model hyperparameters, derived from the .nemo config rather than hardcoded so
+    # that a second checkpoint cannot be silently misconfigured.
+    enc = model_config['encoder']
+    d_model = enc['d_model']
+    n_heads = enc['n_heads']
+    # The vocab list holds num_classes real tokens; the blank is appended as the last id.
+    num_classes = model_config['joint']['num_classes']
+    assert num_classes == len(vocab), f"num_classes {num_classes} != vocab {len(vocab)}"
+
+    # Left context is uniform across the att_context_size options; right context is the
+    # per-option lookahead and is selected at runtime, not baked into the weights.
+    att_left_context = max(pair[0] for pair in enc['att_context_size'])
+
     hparams = {
-        "nemo.n_mels": 128,
-        "nemo.d_model": 1024,
-        "nemo.n_heads": 8,
-        "nemo.d_head": 128,
-        "nemo.d_ff": 4096,
-        "nemo.n_layers": 24,
-        "nemo.kernel_size": 31,
-        "nemo.vocab_size": 1025,
-        "nemo.decoder_dim": 320,
-        "nemo.joint_dim": 640,
+        "nemo.n_mels": enc['feat_in'],
+        "nemo.d_model": d_model,
+        "nemo.n_heads": n_heads,
+        "nemo.d_head": d_model // n_heads,
+        "nemo.d_ff": d_model * enc['ff_expansion_factor'],
+        "nemo.n_layers": enc['n_layers'],
+        "nemo.kernel_size": enc['conv_kernel_size'],
+        "nemo.vocab_size": num_classes + 1,
+        "nemo.decoder_dim": model_config['decoder']['prednet']['pred_hidden'],
+        "nemo.joint_dim": model_config['joint']['jointnet']['joint_hidden'],
+        "nemo.subsampling_factor": enc['subsampling_factor'],
+        "nemo.att_left_context": att_left_context,
+        # 0 for the English model; 128 for the multilingual prompt-conditioned one.
+        "nemo.num_prompts": model_config.get('num_prompts', 0),
     }
+    print("\nHyperparameters from model_config.yaml:")
+    for k, v in hparams.items():
+        print(f"  {k} = {v}")
+
+    model_name = Path(input_path).stem
 
     # Prepare tensor info
     tensor_infos = []
@@ -404,17 +462,24 @@ def convert_to_gguf(
     # Write GGUF file
     print(f"\nWriting GGUF to {output_path}...")
 
+    # The legacy blob is written alongside the string array whenever every token fits,
+    # so that binaries predating the string-array reader keep loading English models.
+    vocab_legacy = pack_vocab_legacy(vocab)
+    n_kv = len(hparams) + 3 + (1 if vocab_legacy is not None else 0)
+
     with open(output_path, 'wb') as f:
         # Write header
         f.write(GGUF_MAGIC)
         f.write(struct.pack('<I', GGUF_VERSION))
         f.write(struct.pack('<q', len(tensor_infos)))  # n_tensors
-        f.write(struct.pack('<q', len(hparams) + 3))  # n_kv
+        f.write(struct.pack('<q', n_kv))
 
         # Write KV pairs
         write_kv_string(f, "general.architecture", "nemo")
-        write_kv_string(f, "general.name", "nemotron-speech-streaming-en-0.6b")
-        write_kv_string(f, "tokenizer.vocab", vocab)
+        write_kv_string(f, "general.name", model_name)
+        write_kv_array_string(f, "tokenizer.vocab_list", vocab)
+        if vocab_legacy is not None:
+            write_kv_string(f, "tokenizer.vocab", vocab_legacy)
 
         for key, value in hparams.items():
             if isinstance(value, int):

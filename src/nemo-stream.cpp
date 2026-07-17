@@ -9,7 +9,7 @@
 
 typedef long long int lli;
 // Forward declaration from nemo-ggml.cpp
-std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab);
+std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<std::string> & vocab);
 
 // nemo_decoder_state::init and reset are now inline in nemo-ggml.h
 
@@ -697,10 +697,10 @@ struct nemo_stream_context* nemo_stream_init(
 }
 
 // Forward declaration for token to text conversion (from nemo-ggml.cpp)
-std::string tokens_to_text(const std::vector<timed_token>& tokens, const std::vector<char8>& vocab, bool timestamp_words);
+std::string tokens_to_text(const std::vector<timed_token>& tokens, const std::vector<std::string>& vocab, bool timestamp_words);
 
 // Helper to convert plain token IDs to text (no timestamps)
-static std::string tokens_to_text_simple(const std::vector<int>& token_ids, const std::vector<char8>& vocab) {
+static std::string tokens_to_text_simple(const std::vector<int>& token_ids, const std::vector<std::string>& vocab) {
     std::vector<timed_token> tokens;
     tokens.reserve(token_ids.size());
     for (int id : token_ids) {

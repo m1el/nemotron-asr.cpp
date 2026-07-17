@@ -41,11 +41,17 @@ struct nemo_hparams {
     int32_t d_head      = 128;    // head dimension (d_model / n_heads)
     int32_t d_ff        = 4096;   // feedforward dimension
     int32_t n_layers    = 24;     // number of conformer layers
-    int32_t kernel_size = 31;     // conv kernel size
-    int32_t vocab_size  = 1025;   // vocabulary size (1024 tokens + blank)
-    int32_t decoder_dim = 320;    // decoder LSTM hidden size
+    int32_t kernel_size = 9;      // conv kernel size
+    int32_t vocab_size  = 1025;   // vocabulary size (real tokens + blank)
+    int32_t decoder_dim = 640;    // decoder LSTM hidden size
     int32_t joint_dim   = 640;    // joint network hidden size
+    int32_t subsampling_factor = 8;
+    int32_t att_left_context   = 70;  // 70 for the English model, 56 for multilingual
+    int32_t num_prompts = 0;      // 0 = no language-ID conditioning; 128 for multilingual
     float   eps         = 1e-5f;  // layer norm epsilon
+
+    // The blank is the last vocabulary id.
+    int32_t blank_token() const { return vocab_size - 1; }
 };
 
 // ConvSubsampling weights (depthwise-separable architecture)
@@ -154,9 +160,15 @@ struct nemo_joint {
     struct ggml_tensor * out_b;           // [1025]
 };
 
-struct char8 {
-    // null-terminated string, at most 7 chars
-    char data[8];
+// Language-ID prompt conditioning (multilingual checkpoints only).
+// A one-hot language vector is broadcast across time, concatenated onto the encoder
+// output, then projected back to d_model: Linear(d_model+num_prompts, 2*d_model)
+// -> ReLU -> Linear(2*d_model, d_model). Absent when hparams.num_prompts == 0.
+struct nemo_prompt_kernel {
+    struct ggml_tensor * fc1_w;           // [1152, 2048]
+    struct ggml_tensor * fc1_b;           // [2048]
+    struct ggml_tensor * fc2_w;           // [2048, 1024]
+    struct ggml_tensor * fc2_b;           // [1024]
 };
 
 // Preprocessor weights (mel filterbank and window)
@@ -168,10 +180,11 @@ struct nemo_preprocessor_weights {
 // Full model
 struct nemo_model {
     nemo_hparams hparams;
-    std::vector<char8> vocab;
+    std::vector<std::string> vocab;
     nemo_encoder encoder;
     nemo_decoder decoder;
     nemo_joint joint;
+    nemo_prompt_kernel prompt_kernel;   // only populated when hparams.num_prompts > 0
     nemo_preprocessor_weights preprocessor_weights;
 
     // Precomputed positional embeddings
@@ -193,6 +206,7 @@ struct nemo_state {
     static constexpr int HIDDEN_SIZE = 640;
     static constexpr int NUM_LAYERS = 2;
 
+    int blank_token = 1024;               // set from hparams at load time
     std::vector<float> h;                 // [NUM_LAYERS * HIDDEN_SIZE]
     std::vector<float> c;                 // [NUM_LAYERS * HIDDEN_SIZE]
     int prev_token;
@@ -200,12 +214,12 @@ struct nemo_state {
     // Allocator for compute graphs
     ggml_gallocr_t allocr;
 
-    nemo_state() : h(NUM_LAYERS * HIDDEN_SIZE, 0.0f), c(NUM_LAYERS * HIDDEN_SIZE, 0.0f), prev_token(1024) {}
+    nemo_state() : h(NUM_LAYERS * HIDDEN_SIZE, 0.0f), c(NUM_LAYERS * HIDDEN_SIZE, 0.0f), prev_token(blank_token) {}
 
     void reset() {
         std::fill(h.begin(), h.end(), 0.0f);
         std::fill(c.begin(), c.end(), 0.0f);
-        prev_token = 1024;  // blank token
+        prev_token = blank_token;
     }
 
     // Get h state for layer l
@@ -224,6 +238,10 @@ struct nemo_context {
     // Number of threads for computation (CPU backend only)
     int n_threads = 4;
     bool timestamp_words = false;
+
+    // Language-ID prompt index for multilingual models (index into num_prompts).
+    // Ignored when hparams.num_prompts == 0. Defaults to 101 ("auto") at load time.
+    int prompt_index = -1;
 };
 
 // API functions

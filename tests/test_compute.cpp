@@ -2377,7 +2377,7 @@ std::vector<timed_token> greedy_decode(
     ggml_backend_t backend
 );
 
-std::string tokens_to_text(const std::vector<timed_token> & tokens, const std::vector<char8> & vocab, bool time_words = false);
+std::string tokens_to_text(const std::vector<timed_token> & tokens, const std::vector<std::string> & vocab, bool time_words = false);
 
 bool test_decoder() {
     printf("=== Testing Decoder (LSTM) ===\n");
@@ -2710,13 +2710,10 @@ bool test_greedy_decode() {
     printf("Sample vocab entries from GGUF (vocab.size=%zu):\n", ctx->model.vocab.size());
     for (int i : {0, 1, 2, 130, 500, 1024}) {
         if (i < (int)ctx->model.vocab.size()) {
-            printf("  vocab[%d] = '", i);
-            for (int j = 0; j < 8 && ctx->model.vocab[i].data[j]; j++) {
-                printf("%c", ctx->model.vocab[i].data[j]);
-            }
-            printf("' (hex:");
-            for (int j = 0; j < 8; j++) {
-                printf(" %02x", (unsigned char)ctx->model.vocab[i].data[j]);
+            const std::string & tok = ctx->model.vocab[i];
+            printf("  vocab[%d] = '%s' (hex:", i, tok.c_str());
+            for (unsigned char c : tok) {
+                printf(" %02x", c);
             }
             printf(")\n");
         }

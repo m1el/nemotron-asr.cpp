@@ -924,7 +924,7 @@ bool test_token_state() {
     state.final_transcript = "";
     
     // Simulate cleanup_after_eou
-    std::vector<char8> dummy_vocab;  // Not used in cleanup
+    std::vector<std::string> dummy_vocab;  // Not used in cleanup
     state.cleanup_after_eou(dummy_vocab);
     
     if (state.final_transcript != "hello world") {
