@@ -248,11 +248,11 @@ int main(int argc, char ** argv) {
         if (got_bytes < want_bytes) break;
     }
 
-    // Flush ASR. nemo_stream_finalize returns the cumulative transcript,
-    // not the trailing increment, so we ignore it for diarization to avoid
-    // duplicating words. Replace the live-streaming line with an explicit
-    // newline so subsequent output starts on its own line.
-    (void)nemo_stream_finalize(sctx);
+    // Flush ASR. nemo_stream_finalize returns only the trailing increment from
+    // the final partial chunk (not the cumulative transcript), so emit it like any
+    // other increment: print it and feed it to diarization at the current time.
+    std::string final_tail = nemo_stream_finalize(sctx);
+    handle_text(final_tail, total_samples, /*is_incremental=*/true);
     printf("\n");
 
     if (!read_from_stdin && input) fclose(input);
